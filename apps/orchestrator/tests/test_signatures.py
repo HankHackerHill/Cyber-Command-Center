@@ -1,9 +1,10 @@
+import json
 from datetime import datetime, timezone
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from signatures import verify_human_signature
+from signatures import load_operator_public_keys, verify_human_signature
 from contracts.events import ActorType, Ed25519Signature, EngagementState, TransitionEvent
 
 
@@ -59,3 +60,37 @@ def test_only_human_records_qualify(actor_type: ActorType) -> None:
     key = Ed25519PrivateKey.generate()
     event = signed_record(key, actor_type=actor_type)
     assert not verify_human_signature(event, {event.actor_id: key.public_key()})
+
+
+def test_public_keys_are_optional(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ORCHESTRATOR_OPERATOR_PUBLIC_KEYS", raising=False)
+    assert load_operator_public_keys() == {}
+
+
+def test_loads_operator_public_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    key = Ed25519PrivateKey.generate()
+    second = Ed25519PrivateKey.generate().public_key()
+    monkeypatch.setenv("ORCHESTRATOR_OPERATOR_PUBLIC_KEYS", json.dumps({
+        "op-A": key.public_key().public_bytes_raw().hex().upper(),
+        "op-B": second.public_bytes_raw().hex(),
+    }))
+    keys = load_operator_public_keys()
+    assert keys["op-B"] == second
+    assert verify_human_signature(signed_record(key), keys)
+
+
+@pytest.mark.parametrize("value", [
+    "", "[]", "invalid-json", '{"op-A": null}',
+    json.dumps({"op-A": "11" * 31}), json.dumps({"op-A": "xx" * 32}),
+    json.dumps({"": "22" * 32}), json.dumps({"op-A": "11" * 32, "op-B": "short"}),
+    '{"op-A":"' + "11" * 32 + '","op-A":"' + "22" * 32 + '"}',
+])
+def test_invalid_trust_store_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, value: str,
+) -> None:
+    monkeypatch.setenv("ORCHESTRATOR_OPERATOR_PUBLIC_KEYS", value)
+    assert load_operator_public_keys() == {}
+    assert caplog.messages == [
+        "Invalid ORCHESTRATOR_OPERATOR_PUBLIC_KEYS configuration. "
+        "Signature verification has no trusted operator keys."
+    ]

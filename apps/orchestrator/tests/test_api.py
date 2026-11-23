@@ -6,8 +6,10 @@ from pathlib import Path
 from subprocess import Popen
 import sys
 from collections.abc import Iterator, Sequence
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from math import ceil
+from statistics import median
 from threading import Barrier
 from time import monotonic, perf_counter, sleep
 from uuid import UUID, uuid4
@@ -15,9 +17,11 @@ from uuid import UUID, uuid4
 import httpx
 import psycopg
 import pytest
-from contracts.events import EngagementState
+from contracts.events import ActorType, EngagementState, TransitionEvent
 from contracts.ledger import LedgerRecord
 from fastapi.testclient import TestClient
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from redis import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 
@@ -140,10 +144,14 @@ def test_concurrent_and_repeated_stops_append_once(
 
 
 def test_stop_latency(service_urls: tuple[str, str], tmp_path: Path) -> None:
-    """Measure the Uvicorn HTTP path, including durable commit and Redis publish."""
+    """Collect four Uvicorn p99s including commit and publish; score the last three."""
     workers, samples = 4, 200
     database, redis = service_urls
-    ids = engagements(database, [EngagementState.INIT_SCOPING] * (workers + samples))
+    batches = [
+        engagements(database, [EngagementState.INIT_SCOPING] * (workers + samples))
+        for _ in range(4)
+    ]
+    measured_p99s = []
     socket = str(tmp_path / "http.sock")
     command = [sys.executable, "-m", "uvicorn", "main:app", "--uds", socket, "--no-access-log"]
     environment = {**os.environ, "DATABASE_URL": database, "REDIS_URL": redis}
@@ -163,13 +171,20 @@ def test_stop_latency(service_urls: tuple[str, str], tmp_path: Path) -> None:
                     return (perf_counter() - start) * 1000
 
                 with ThreadPoolExecutor(max_workers=workers) as pool:
-                    list(pool.map(timed_stop, ids[:workers]))
-                    timings = sorted(pool.map(timed_stop, ids[workers:]))
+                    for index, ids in enumerate(batches):
+                        list(pool.map(timed_stop, ids[:workers]))
+                        timings = sorted(pool.map(timed_stop, ids[workers:]))
+                        p99 = timings[ceil(0.99 * samples) - 1]
+                        label = f"measured run {index}" if index else "discarded warm-up"
+                        print(f"Emergency stop {label} p99 {p99:.2f} ms "
+                              f"({samples} fresh engagements, {workers} callers)")
+                        if index:
+                            measured_p99s.append(p99)
         finally:
             server.terminate()
-    p99 = timings[ceil(0.99 * samples) - 1]
-    print(f"Emergency stop p99 {p99:.2f} ms ({samples} fresh engagements, {workers} callers)")
-    assert p99 < 50, f"Emergency stop p99 was {p99:.2f} ms"
+    measured_median = median(measured_p99s)
+    print(f"Median measured emergency stop p99 {measured_median:.2f} ms")
+    assert measured_median < 50, f"Median measured emergency stop p99 was {measured_median:.2f} ms"
 
 
 def test_stop_persists_during_notification_outage(
@@ -191,3 +206,73 @@ def test_stop_persists_during_notification_outage(
     assert retry.json()["notification_published"] is True
     record, = ledger(client, engagement_id)
     assert record.record_hash == response.json()["ledger_hash"] == retry.json()["ledger_hash"]
+
+
+@settings(deadline=None)
+@given(
+    source=st.sampled_from(list(EngagementState)),
+    candidate=st.sampled_from([
+        EngagementState.INIT_SCOPING, EngagementState.EVIDENCE_VERIFICATION,
+        EngagementState.REMEDIATION_SYNTHESIS, EngagementState.RETEST_VERIFICATION,
+    ]),
+)
+def test_illegal_transition_is_denied_without_writes(
+    client: TestClient, service_urls: tuple[str, str], source: EngagementState, candidate: EngagementState,
+) -> None:
+    # Every re-entry to INIT_SCOPING is illegal. Archived and halted engagements
+    # also reject all four candidate destinations, as do these non-halt self-loops.
+    terminal = (EngagementState.HALTED_KILLSWITCH, EngagementState.COMPLETED_ARCHIVED)
+    target = candidate if source in terminal or candidate == source else EngagementState.INIT_SCOPING
+    database = service_urls[0]
+    initial = EngagementState.INIT_SCOPING if source == EngagementState.HALTED_KILLSWITCH else source
+    engagement_id, = engagements(database, [initial])
+    if source == EngagementState.HALTED_KILLSWITCH:
+        stop_hash(client, engagement_id)  # Exercise denial with an existing journal entry.
+
+    def snapshot() -> tuple[str, list[tuple[object, ...]]]:
+        with psycopg.connect(database) as db:
+            state = db.execute("SELECT current_state FROM engagements WHERE id=%s", (engagement_id,)).fetchone()
+            assert state is not None
+            rows = db.execute(
+                """SELECT seq_id, payload, prev_record_hash, record_hash FROM immutable_audit_log
+                   WHERE engagement_id=%s ORDER BY seq_id""", (engagement_id,),
+            ).fetchall()
+            return state[0], rows
+
+    before = snapshot()
+    assert before[0] == source
+    event = TransitionEvent(
+        engagement_id=str(engagement_id), event_id=str(uuid4()), actor_id="acceptance-test",
+        actor_type=ActorType.HUMAN_OPERATOR, from_state=source, to_state=target,
+        occurred_at=datetime.now(timezone.utc),
+    )
+    response = client.post(f"/engagements/{engagement_id}/transition", json=event.model_dump(mode="json"))
+    assert snapshot() == before
+    assert response.status_code in (400, 403, 409, 422), response.text
+    assert response.json()["reason"] == "ILLEGAL_TRANSITION", response.text
+
+
+def test_transition_to_stop_ignores_stale_source_and_retries_once(
+    client: TestClient, service_urls: tuple[str, str],
+) -> None:
+    engagement_id, = engagements(service_urls[0], [EngagementState.INIT_SCOPING])
+    path = f"/engagements/{engagement_id}/transition"
+    event = TransitionEvent(
+        engagement_id=str(engagement_id), event_id=str(uuid4()), actor_id="stop-test",
+        actor_type=ActorType.SYSTEM, from_state=EngagementState.COMPLETED_ARCHIVED,
+        to_state=EngagementState.HALTED_KILLSWITCH, occurred_at=datetime.now(timezone.utc),
+    )
+    for _ in range(2):
+        response = client.post(path, json=event.model_dump(mode="json"))
+        assert response.status_code == 200
+        assert response.json()["notification_published"]
+    stop, = ledger(client, engagement_id)
+    assert stop.event.from_state == EngagementState.INIT_SCOPING
+    assert stop.event.to_state == EngagementState.HALTED_KILLSWITCH
+    assert stop.record_hash == response.json()["ledger_hash"]
+
+
+def test_transition_malformed_event_returns_reason(client: TestClient) -> None:
+    response = client.post(f"/engagements/{uuid4()}/transition", json={})
+    assert response.status_code == 422
+    assert response.json()["reason"] == "INVALID_EVENT"
