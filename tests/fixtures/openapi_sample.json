@@ -1,0 +1,30 @@
+{
+  "openapi": "3.1.0",
+  "info": {"title": "ACME Staging API", "version": "1.4.2"},
+  "servers": [{"url": "https://api.staging.example.com"}],
+  "paths": {
+    "/v1/users/{id}": {
+      "get": {
+        "summary": "Get user by ID",
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "responses": {"200": {"description": "User record"}},
+        "x-roles": ["admin", "manager", "user"]
+      }
+    },
+    "/v1/reports": {
+      "post": {
+        "summary": "Create report",
+        "requestBody": {"content": {"application/json": {"schema": {"type": "object"}}}},
+        "responses": {"201": {"description": "Created"}},
+        "x-roles": ["manager", "admin"]
+      }
+    },
+    "/v1/admin/reset-tenant": {
+      "post": {
+        "summary": "Reset tenant (RoE-excluded path)",
+        "responses": {"200": {"description": "Reset confirmation"}},
+        "x-roles": ["admin"]
+      }
+    }
+  }
+}

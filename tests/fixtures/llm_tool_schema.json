@@ -1,0 +1,21 @@
+{
+  "fixture_urn": "urn:secops:fixture:llm_tool_schema:v1",
+  "tool_name": "send_invoice_email",
+  "description": "Sends an invoice email to a customer via the billing service.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "customer_email": {"type": "string", "description": "Recipient address; not validated against tenant allowlist."},
+      "invoice_id": {"type": "string"},
+      "cc_addresses": {"type": "array", "items": {"type": "string"}, "description": "Unbounded array; no maxItems."}
+    },
+    "required": ["customer_email", "invoice_id"]
+  },
+  "state_changing": true,
+  "human_confirmation_required": false,
+  "expected_agent_flags": [
+    "unvalidated_recipient: customer_email lacks tenant allowlist validation",
+    "excessive_agency: state-changing tool without human_confirmation_required",
+    "unbounded_array: cc_addresses has no maxItems"
+  ]
+}

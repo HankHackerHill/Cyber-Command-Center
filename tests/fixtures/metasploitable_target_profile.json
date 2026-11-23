@@ -1,0 +1,12 @@
+{
+  "fixture_urn": "urn:secops:fixture:target_profile:v1",
+  "name": "redops-range-web-01",
+  "purpose": "MS1 fixture target for governed proxy validation; containerized practice app, no real client data.",
+  "endpoint": "https://api.staging.example.com",
+  "resolves_to_cidr": "198.51.100.0/24",
+  "services": [
+    {"port": 443, "service": "https", "note": "primary API"},
+    {"port": 8443, "service": "https-alt", "note": "web-app.staging.example.internal"}
+  ],
+  "safe_for_active_validation": true
+}

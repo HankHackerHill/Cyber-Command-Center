@@ -1,0 +1,31 @@
+{
+  "manifest_urn": "urn:secops:roe:v1",
+  "engagement_id": "eng_9f82a1c4",
+  "assessment_types": ["WEB_API", "CLOUD_CONFIG"],
+  "execution_mode": "HYBRID",
+  "valid_window": {
+    "not_before": "2026-12-01T08:00:00Z",
+    "not_after": "2026-12-12T22:00:00Z",
+    "allowed_days_utc": ["MON", "TUE", "WED", "THU", "FRI"]
+  },
+  "scope_boundaries": {
+    "allowed_cidrs": ["198.51.100.0/24"],
+    "allowed_identifiers": [
+      "api.staging.example.com",
+      "web-app.staging.example.internal",
+      "arn:aws:iam::123456789012:role/*"
+    ],
+    "excluded_paths": ["/v1/billing/charge", "/admin/reset-tenant"],
+    "allowed_http_methods": ["GET", "HEAD", "OPTIONS", "POST"]
+  },
+  "traffic_constraints": {
+    "max_requests_per_second": 10,
+    "max_concurrent_workers": 2,
+    "required_attribution_header": "X-Security-Assessment-ID: eng_9f82a1c4",
+    "circuit_breaker_5xx_threshold": 5
+  },
+  "signatures": {
+    "lead_operator_sig": "ed25519:9f2c4e6a8b0d1f3a9f2c4e6a8b0d1f3a9f2c4e6a8b0d1f3a9f2c4e6a8b0d1f3a9f2c4e6a8b0d1f3a9f2c4e6a8b0d1f3a9f2c4e6a8b0d1f3a9f2c4e6a8b0d1f3a",
+    "policy_hash_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}
