@@ -4,6 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from ipaddress import IPv4Network, IPv6Network
 from typing import Annotated, Literal, Self
+from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
@@ -87,6 +88,12 @@ class Engagement(BaseModel):
 
     @model_validator(mode="after")
     def check_manifest_owner(self) -> Self:
-        if self.roe_manifest is not None and self.roe_manifest.engagement_id != self.id:
-            raise ValueError("RoE manifest belongs to another engagement")
-        return self
+        if self.roe_manifest is None or self.roe_manifest.engagement_id == self.id:
+            return self
+        # PostgreSQL returns canonical UUIDs. Preserve the original signed spelling.
+        try:
+            if UUID(self.roe_manifest.engagement_id) == UUID(self.id):
+                return self
+        except ValueError:
+            pass
+        raise ValueError("RoE manifest belongs to another engagement")

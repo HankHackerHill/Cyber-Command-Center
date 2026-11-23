@@ -34,7 +34,7 @@ export type ActorType = "HUMAN_OPERATOR" | "AI_AGENT" | "SYSTEM";
 export type JsonValue = unknown;
 export type EdgeKind = "SECRET_REUSE" | "IAM_ASSUME" | "NET_REACH" | "K8S_RBAC";
 export type FindingStatus = "HYPOTHESIS" | "PENDING_VALIDATION" | "CONFIRMED" | "FALSE_POSITIVE" | "REMEDIATED";
-export type TaskMode = "MANUAL" | "AUTONOMOUS_PASSIVE";
+export type TaskMode = "MANUAL_ONLY" | "AI_AUTONOMOUS_PASSIVE" | "AI_PROPOSED_HITL_GATED";
 export type TaskStatus = "QUEUED" | "RUNNING" | "PAUSED_HITL" | "DONE" | "REJECTED";
 export type BlastRadius = "READ_ONLY" | "REVERSIBLE" | "DESTRUCTIVE";
 

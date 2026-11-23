@@ -43,3 +43,12 @@ def test_rejects_manifest_for_another_engagement() -> None:
     manifest = RoeManifest.model_validate_json(FIXTURE.read_bytes())
     with pytest.raises(ValidationError, match="another engagement"):
         Engagement(id=manifest.engagement_id + "-other", roe_manifest=manifest)
+
+
+def test_database_uuid_preserves_manifest_spelling() -> None:
+    raw = json.loads(FIXTURE.read_bytes())
+    stored_id = "c8345f78-ec95-4f36-9cb7-07658a959da1"
+    raw["engagement_id"] = stored_id.upper()
+    manifest = RoeManifest.model_validate(raw)
+    engagement = Engagement(id=stored_id, roe_manifest=manifest)
+    assert engagement.model_dump(mode="json")["roe_manifest"] == raw

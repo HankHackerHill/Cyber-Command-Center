@@ -6,8 +6,9 @@ from pydantic import BaseModel, ConfigDict
 
 
 class TaskMode(StrEnum):
-    MANUAL = "MANUAL"
-    AUTONOMOUS_PASSIVE = "AUTONOMOUS_PASSIVE"
+    MANUAL_ONLY = "MANUAL_ONLY"
+    AI_AUTONOMOUS_PASSIVE = "AI_AUTONOMOUS_PASSIVE"
+    AI_PROPOSED_HITL_GATED = "AI_PROPOSED_HITL_GATED"
 
 
 class TaskStatus(StrEnum):

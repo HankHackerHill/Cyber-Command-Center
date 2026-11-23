@@ -38,7 +38,7 @@ def examples() -> Iterator[BaseModel]:
         "id": "plan-1", "engagement_id": engagement.id, "blast_radius": "READ_ONLY",
     })
     yield WorkflowTask.model_validate({
-        "id": "task-1", "engagement_id": engagement.id, "mode": "MANUAL",
+        "id": "task-1", "engagement_id": engagement.id, "mode": "MANUAL_ONLY",
     })
     yield Finding(id="fnd-0001", engagement_id=engagement.id, title="Sample", confidence_score=0.5)
 
@@ -85,3 +85,16 @@ def test_confidence_bounds(score: float) -> None:
 def test_finding_defaults_to_hypothesis(score: float) -> None:
     finding = Finding(id="f", engagement_id="eng", title="Sample", confidence_score=score)
     assert finding.status == FindingStatus.HYPOTHESIS
+
+
+@pytest.mark.parametrize("mode", ["MANUAL_ONLY", "AI_AUTONOMOUS_PASSIVE", "AI_PROPOSED_HITL_GATED"])
+def test_workflow_task_modes_round_trip(mode: str) -> None:
+    task = WorkflowTask.model_validate({"id": "task-1", "engagement_id": "eng", "mode": mode})
+    assert task.model_dump(mode="json")["mode"] == mode
+
+
+@pytest.mark.parametrize("mode", ["MANUAL", "AUTONOMOUS_PASSIVE"])
+def test_workflow_task_rejects_old_modes(mode: str) -> None:
+    with pytest.raises(ValidationError) as error:
+        WorkflowTask.model_validate({"id": "task-1", "engagement_id": "eng", "mode": mode})
+    assert error.value.errors()[0]["loc"] == ("mode",)

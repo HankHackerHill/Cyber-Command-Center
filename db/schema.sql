@@ -5,7 +5,7 @@ CREATE TYPE engagement_state AS ENUM (
     'HALTED_KILLSWITCH'
 );
 CREATE TYPE actor_type AS ENUM ('HUMAN_OPERATOR', 'AI_AGENT', 'SYSTEM');
-CREATE TYPE task_mode AS ENUM ('MANUAL', 'AUTONOMOUS_PASSIVE');
+CREATE TYPE task_mode AS ENUM ('MANUAL_ONLY', 'AI_AUTONOMOUS_PASSIVE', 'AI_PROPOSED_HITL_GATED');
 CREATE TYPE task_status AS ENUM ('QUEUED', 'RUNNING', 'PAUSED_HITL', 'DONE', 'REJECTED');
 CREATE TYPE finding_status AS ENUM (
     'HYPOTHESIS', 'PENDING_VALIDATION', 'CONFIRMED', 'FALSE_POSITIVE', 'REMEDIATED'
@@ -14,15 +14,18 @@ CREATE TYPE edge_kind AS ENUM ('SECRET_REUSE', 'IAM_ASSUME', 'NET_REACH', 'K8S_R
 CREATE TYPE blast_radius AS ENUM ('READ_ONLY', 'REVERSIBLE', 'DESTRUCTIVE');
 
 CREATE TABLE engagements (
-    id text PRIMARY KEY CHECK (id <> ''),
+    id uuid PRIMARY KEY,
     current_state engagement_state NOT NULL DEFAULT 'INIT_SCOPING',
     roe_manifest jsonb,
     roe_signature_hash char(64) CHECK (roe_signature_hash ~ '^[0-9a-f]{64}$'),
-    CHECK (roe_manifest IS NULL OR (roe_manifest -> 'engagement_id' = to_jsonb(id)) IS TRUE)
+    CHECK (roe_manifest IS NULL OR (
+        jsonb_typeof(roe_manifest -> 'engagement_id') = 'string'
+        AND (roe_manifest ->> 'engagement_id')::uuid = id
+    ) IS TRUE)
 );
 
 CREATE TABLE asset_nodes (
-    engagement_id text NOT NULL REFERENCES engagements (id),
+    engagement_id uuid NOT NULL REFERENCES engagements (id),
     id uuid NOT NULL,
     asset_category text NOT NULL,
     canonical_identifier text NOT NULL,
@@ -33,7 +36,7 @@ CREATE TABLE asset_nodes (
 );
 
 CREATE TABLE findings (
-    engagement_id text NOT NULL REFERENCES engagements (id),
+    engagement_id uuid NOT NULL REFERENCES engagements (id),
     id text NOT NULL,
     title text NOT NULL,
     confidence_score numeric(3,2) NOT NULL CHECK (confidence_score BETWEEN 0 AND 1),
@@ -43,7 +46,7 @@ CREATE TABLE findings (
 );
 
 CREATE TABLE asset_edges (
-    engagement_id text NOT NULL REFERENCES engagements (id),
+    engagement_id uuid NOT NULL REFERENCES engagements (id),
     id text NOT NULL,
     src_node uuid NOT NULL,
     dst_node uuid NOT NULL,
@@ -58,7 +61,7 @@ CREATE TABLE asset_edges (
 );
 
 CREATE TABLE workflow_tasks (
-    engagement_id text NOT NULL REFERENCES engagements (id),
+    engagement_id uuid NOT NULL REFERENCES engagements (id),
     id text NOT NULL,
     mode task_mode NOT NULL,
     status task_status NOT NULL DEFAULT 'QUEUED',
@@ -78,7 +81,7 @@ CREATE DOMAIN ed25519_signature AS jsonb CHECK (
 );
 
 CREATE TABLE validation_plans (
-    engagement_id text NOT NULL REFERENCES engagements (id),
+    engagement_id uuid NOT NULL REFERENCES engagements (id),
     id text NOT NULL CHECK (id <> ''),
     blast_radius blast_radius NOT NULL,
     approver_sig ed25519_signature,
@@ -92,7 +95,7 @@ CREATE TABLE validation_plans (
 );
 
 CREATE TABLE attack_chains (
-    engagement_id text NOT NULL REFERENCES engagements (id),
+    engagement_id uuid NOT NULL REFERENCES engagements (id),
     id text NOT NULL,
     path_node_ids uuid[] NOT NULL CHECK (
         array_ndims(path_node_ids) = 1 AND cardinality(path_node_ids) > 0
@@ -103,12 +106,15 @@ CREATE TABLE attack_chains (
 
 CREATE TABLE immutable_audit_log (
     seq_id bigserial PRIMARY KEY CHECK (seq_id > 0),
-    event jsonb NOT NULL CHECK (jsonb_typeof(event) = 'object'),
-    engagement_id text GENERATED ALWAYS AS (event ->> 'engagement_id') STORED
-        NOT NULL REFERENCES engagements (id),
+    payload jsonb NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
     prev_record_hash char(64) NOT NULL CHECK (prev_record_hash ~ '^[0-9a-f]{64}$'),
-    record_hash char(64) NOT NULL CHECK (record_hash ~ '^[0-9a-f]{64}$')
+    record_hash char(64) NOT NULL CHECK (record_hash ~ '^[0-9a-f]{64}$'),
+    engagement_id uuid GENERATED ALWAYS AS ((payload->>'engagement_id')::uuid) STORED
+        NOT NULL REFERENCES engagements(id)
 );
+
+CREATE INDEX immutable_audit_log_engagement_id_idx
+    ON immutable_audit_log USING btree (engagement_id);
 
 CREATE FUNCTION reject_audit_log_mutation() RETURNS trigger
 LANGUAGE plpgsql AS $$

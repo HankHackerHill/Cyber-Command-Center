@@ -6,6 +6,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import ValidationError
 
 from contracts.events import ActorType, Ed25519Signature, EngagementState, TransitionEvent
+from contracts.ledger import LedgerRecord
 from contracts.plans import BlastRadius, ValidationPlan
 
 
@@ -86,3 +87,19 @@ def test_destructive_plan_requires_independent_approvals() -> None:
         {**plan, "approver_sig": first, "second_approver_sig": second}
     )
     assert approved.second_approver_sig == second
+
+
+def test_ledger_payload_round_trip_preserves_signed_bytes() -> None:
+    event = TransitionEvent.model_validate({
+        **UNSIGNED, "engagement_id": "c8345f78-ec95-4f36-9cb7-07658a959da1",
+    })
+    key = Ed25519PrivateKey.generate()
+    sig = Ed25519Signature(signer_id=event.actor_id, signature=key.sign(event.canonical_envelope()).hex())
+    signed = event.model_copy(update={"hitl_signature": sig})
+    record = LedgerRecord(seq_id=1, event=signed, prev_record_hash="0" * 64, record_hash="1" * 64)
+    storage = record.model_dump(mode="json", by_alias=True)
+    assert storage["payload"] == signed.model_dump(mode="json")
+    assert "event" not in storage
+    restored = LedgerRecord.model_validate(storage)
+    assert restored == LedgerRecord.model_validate(record.model_dump())
+    key.public_key().verify(bytes.fromhex(sig.signature), restored.event.canonical_envelope())
