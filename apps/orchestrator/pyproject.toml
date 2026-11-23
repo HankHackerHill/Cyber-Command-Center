@@ -32,5 +32,6 @@ testpaths = ["tests"]
 
 [tool.mypy]
 strict = true
+exclude = ['^(\./)?build/']
 plugins = ["pydantic.mypy"]
 mypy_path = "$MYPY_CONFIG_FILE_DIR/../../packages/contracts-py"
