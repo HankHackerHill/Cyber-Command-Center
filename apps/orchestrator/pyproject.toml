@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redops-orchestrator"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "redops-contracts==0.1.0",
+    "cryptography>=43",
+    "fastapi>=0.115,<1",
+    "psycopg[binary,pool]>=3.2,<4",
+    "redis>=5,<7",
+    "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+test = ["httpx>=0.27,<1", "hypothesis>=6", "mypy>=1.11", "pytest>=8"]
+
+# From apps/orchestrator, uv sync --extra test installs the local MS0 contracts.
+# With pip, use python -m pip install ../../packages/contracts-py '.[test]'.
+[tool.uv.sources]
+redops-contracts = { path = "../../packages/contracts-py" }
+
+[tool.setuptools]
+py-modules = ["main", "deps", "ledger", "signatures"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = "$MYPY_CONFIG_FILE_DIR/../../packages/contracts-py"
