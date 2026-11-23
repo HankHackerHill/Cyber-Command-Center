@@ -31,6 +31,10 @@ class StateResponse(BaseModel):
     state: EngagementState
 
 
+class TransitionError(BaseModel):
+    reason: Reason
+
+
 class ReviewResponse(BaseModel):
     status: Literal["applied"] = "applied"
     next_state: EngagementState
@@ -103,9 +107,24 @@ def create_app(
             return StopResponse(ledger_hash=digest, notification_published=False)
         return StopResponse(ledger_hash=digest, notification_published=True)
 
-    @app.post("/engagements/{id}/transition")
+    @app.post(
+        "/engagements/{id}/transition",
+        responses={
+            403: {
+                "model": TransitionError,
+                "description": "Signature check failed or the requested transition is deferred.",
+            },
+            404: {"model": TransitionError, "description": "Engagement not found."},
+            409: {"model": TransitionError, "description": "Illegal transition or stale source state."},
+            422: {"model": TransitionError, "description": "Invalid event or mismatched engagement ID."},
+        },
+    )
     def transition(id: UUID, event: TransitionEvent, resources: Resources) -> ReviewResponse | StopResponse:
-        """Record evidence review, remediation, signed closure, or an emergency stop."""
+        """Record evidence review, remediation, signed closure, or an emergency stop.
+
+        An otherwise valid request for a deferred transition returns HTTP 403 with
+        reason `TRANSITION_UNAVAILABLE`. The engagement state and audit ledger stay intact.
+        """
         if event.to_state == EngagementState.HALTED_KILLSWITCH:
             require_engagement_id(id, event)
             return killswitch(id, resources)

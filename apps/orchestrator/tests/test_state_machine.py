@@ -231,3 +231,28 @@ def test_remediation_preserves_and_checks_optional_signature(urls: tuple[str, st
         assert client.post(path, json=payload).status_code == 200
         record, = read_ledger(reader, engagement, 0)
         assert record.event == signed
+
+
+def test_deferred_scope_lock_is_denied_without_writes(urls: tuple[str, str]) -> None:
+    database, redis = urls
+    engagement = uuid4()
+    with psycopg.connect(database) as db:
+        db.execute("INSERT INTO engagements (id) VALUES (%s)", (engagement,))
+
+    key = Ed25519PrivateKey.generate()
+    event = TransitionEvent(
+        engagement_id=str(engagement), event_id=str(uuid4()), from_state=EngagementState.INIT_SCOPING,
+        to_state=EngagementState.ROE_LOCKED, actor_type=ActorType.HUMAN_OPERATOR,
+        actor_id="scope-reviewer", occurred_at=datetime.now(timezone.utc),
+    )
+    signature = Ed25519Signature(signer_id=event.actor_id, signature=key.sign(event.canonical_envelope()).hex())
+    signed = event.model_copy(update={"hitl_signature": signature})
+    app = create_app(database_url=database, redis_url=redis, trusted_public_keys={event.actor_id: key.public_key()})
+    with TestClient(app) as client, psycopg.connect(database, autocommit=True) as reader:
+        assert get_state(reader, engagement) == event.from_state
+        assert read_ledger(reader, engagement, 0) == []
+        response = client.post(f"/engagements/{engagement}/transition", json=signed.model_dump(mode="json"))
+        assert response.status_code == 403, response.text
+        assert response.json()["reason"] == "TRANSITION_UNAVAILABLE"
+        assert get_state(reader, engagement) == event.from_state
+        assert read_ledger(reader, engagement, 0) == []
