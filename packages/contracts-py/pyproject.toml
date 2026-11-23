@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redops-contracts"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["pydantic>=2.10,<3"]
+
+[project.optional-dependencies]
+test = ["cryptography>=43", "pytest>=8", "mypy>=1.11"]
+
+[tool.setuptools]
+packages = ["contracts"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+
+# Regenerate the TS wire types from this directory with json-schema-to-typescript 15.0.4.
+# Field titles and default annotations do not declare new TypeScript types.
+# python -c 'import json; from contracts import Contract; from pydantic import TypeAdapter
+# s = TypeAdapter(Contract).json_schema()
+# for model in s["$defs"].values():
+#     for prop in model.get("properties", {}).values():
+#         prop.pop("title", None)
+#         prop.pop("default", None)
+# print(json.dumps(dict(s, title="Contract")))' | json2ts -o ../contracts-ts/index.ts
