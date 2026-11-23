@@ -1,4 +1,4 @@
-"""Engagement audit, signed closure, and emergency stop API."""
+"""Engagement audit, remediation, signed closure, and emergency stop API."""
 
 import json
 import os
@@ -20,7 +20,7 @@ from redis import Redis
 from redis.exceptions import RedisError
 
 from deps import Services, services
-from ledger import EngagementNotFound, archive_engagement, get_state, halt_engagement, read_ledger
+from ledger import EngagementNotFound, get_state, halt_engagement, read_ledger, record_review_transition
 from signatures import load_operator_public_keys
 from state_machine import Reason, TransitionDenied, require_engagement_id
 
@@ -31,9 +31,9 @@ class StateResponse(BaseModel):
     state: EngagementState
 
 
-class ArchiveResponse(BaseModel):
+class ReviewResponse(BaseModel):
     status: Literal["applied"] = "applied"
-    next_state: Literal[EngagementState.COMPLETED_ARCHIVED] = EngagementState.COMPLETED_ARCHIVED
+    next_state: EngagementState
     ledger_hash: str
 
 
@@ -104,14 +104,14 @@ def create_app(
         return StopResponse(ledger_hash=digest, notification_published=True)
 
     @app.post("/engagements/{id}/transition")
-    def transition(id: UUID, event: TransitionEvent, resources: Resources) -> ArchiveResponse | StopResponse:
-        """Record signed closure or an emergency stop."""
+    def transition(id: UUID, event: TransitionEvent, resources: Resources) -> ReviewResponse | StopResponse:
+        """Record evidence review, remediation, signed closure, or an emergency stop."""
         if event.to_state == EngagementState.HALTED_KILLSWITCH:
             require_engagement_id(id, event)
             return killswitch(id, resources)
         with resources.database.connection() as conn:
-            digest = archive_engagement(conn, id, event, keys)
-        return ArchiveResponse(ledger_hash=digest)
+            digest = record_review_transition(conn, id, event, keys)
+        return ReviewResponse(next_state=event.to_state, ledger_hash=digest)
 
     return app
 

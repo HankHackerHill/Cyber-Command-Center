@@ -1,4 +1,4 @@
-"""Read the engagement journal and record stops and signed closures."""
+"""Read the journal and atomically record review transitions and stops."""
 
 import hashlib
 import json
@@ -11,7 +11,7 @@ from contracts.ledger import LedgerRecord
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from psycopg import Connection
 
-from state_machine import Reason, TransitionDenied, require_engagement_id, require_signed_archive
+from state_machine import Reason, TransitionDenied, require_engagement_id, require_review_transition
 
 GENESIS_HASH = "0" * 64
 
@@ -70,25 +70,25 @@ def _tail_hash(conn: Connection, engagement_id: UUID) -> str | None:
     return str(row[0]) if row else None
 
 
-def archive_engagement(
+def record_review_transition(
     conn: Connection, engagement_id: UUID, event: TransitionEvent,
     trusted_keys: Mapping[str, Ed25519PublicKey],
 ) -> str:
     require_engagement_id(engagement_id, event)
-    require_signed_archive(event, trusted_keys)
+    require_review_transition(event, trusted_keys)
     with conn.transaction():
         if _lock_engagement(conn, engagement_id) != event.from_state:
             raise TransitionDenied(Reason.STATE_MISMATCH, 409)
         previous = _tail_hash(conn, engagement_id) or GENESIS_HASH
         digest = hash_record(previous, event)
         conn.execute(
-            """WITH archived AS (
-                   UPDATE engagements SET current_state = 'COMPLETED_ARCHIVED'
+            """WITH recorded AS (
+                   UPDATE engagements SET current_state = %s
                    WHERE id = %s RETURNING id
                )
                INSERT INTO immutable_audit_log (payload, prev_record_hash, record_hash)
-               SELECT %s::jsonb, %s, %s FROM archived""",
-            (engagement_id, event.model_dump_json(), previous, digest),
+               SELECT %s::jsonb, %s, %s FROM recorded""",
+            (event.to_state, engagement_id, event.model_dump_json(), previous, digest),
         )
         return digest
 

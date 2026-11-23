@@ -1,4 +1,4 @@
-"""Transition denials and signature checks for closing an engagement."""
+"""Transition guards for evidence review, remediation, and signed closure."""
 
 from collections.abc import Mapping
 from enum import StrEnum
@@ -17,6 +17,7 @@ class Reason(StrEnum):
     ENGAGEMENT_ID_MISMATCH = "ENGAGEMENT_ID_MISMATCH"
     ILLEGAL_TRANSITION = "ILLEGAL_TRANSITION"
     HUMAN_SIGNATURE_REQUIRED = "HUMAN_SIGNATURE_REQUIRED"
+    INVALID_SIGNATURE = "INVALID_SIGNATURE"
     STATE_MISMATCH = "STATE_MISMATCH"
     TRANSITION_UNAVAILABLE = "TRANSITION_UNAVAILABLE"
 
@@ -34,10 +35,19 @@ HUMAN_ONLY_TARGET_STATES = frozenset({
     EngagementState.COMPLETED_ARCHIVED,
 })
 
-ARCHIVE_SOURCES = frozenset({
-    EngagementState.REMEDIATION_SYNTHESIS,
-    EngagementState.RETEST_VERIFICATION,
-})
+REVIEW_SOURCES = {
+    EngagementState.EVIDENCE_VERIFICATION: frozenset({EngagementState.CONTROLLED_VALIDATION}),
+    EngagementState.REMEDIATION_SYNTHESIS: frozenset({
+        EngagementState.DISCOVERY_PASSIVE,
+        EngagementState.ANALYTICAL_TRIAGE,
+        EngagementState.EVIDENCE_VERIFICATION,
+        EngagementState.RETEST_VERIFICATION,
+    }),
+    EngagementState.COMPLETED_ARCHIVED: frozenset({
+        EngagementState.REMEDIATION_SYNTHESIS,
+        EngagementState.RETEST_VERIFICATION,
+    }),
+}
 
 
 def require_engagement_id(engagement_id: UUID, event: TransitionEvent) -> None:
@@ -49,21 +59,25 @@ def require_engagement_id(engagement_id: UUID, event: TransitionEvent) -> None:
         raise TransitionDenied(Reason.ENGAGEMENT_ID_MISMATCH, 422)
 
 
-def require_signed_archive(
+def require_review_transition(
     event: TransitionEvent,
     trusted_keys: Mapping[str, Ed25519PublicKey],
 ) -> None:
     """Validate the submitted edge and its signer before acquiring a database lock."""
     source, target = event.from_state, event.to_state
+    permitted_sources = REVIEW_SOURCES.get(target)
     if (
         target == source or target == EngagementState.INIT_SCOPING
         or source == EngagementState.COMPLETED_ARCHIVED
         or (source == EngagementState.HALTED_KILLSWITCH and target != EngagementState.ROE_LOCKED)
         or (target == EngagementState.CONTROLLED_VALIDATION and source != EngagementState.AWAITING_HITL_GATE)
-        or (target == EngagementState.COMPLETED_ARCHIVED and source not in ARCHIVE_SOURCES)
+        or (permitted_sources is not None and source not in permitted_sources)
     ):
         raise TransitionDenied(Reason.ILLEGAL_TRANSITION, 409)
-    if target in HUMAN_ONLY_TARGET_STATES and not verify_human_signature(event, trusted_keys):
-        raise TransitionDenied(Reason.HUMAN_SIGNATURE_REQUIRED, 403)
-    if target != EngagementState.COMPLETED_ARCHIVED:
+    signature_required = target in HUMAN_ONLY_TARGET_STATES
+    if signature_required or event.hitl_signature is not None:
+        if not verify_human_signature(event, trusted_keys):
+            reason = Reason.HUMAN_SIGNATURE_REQUIRED if signature_required else Reason.INVALID_SIGNATURE
+            raise TransitionDenied(reason, 403)
+    if permitted_sources is None:
         raise TransitionDenied(Reason.TRANSITION_UNAVAILABLE, 403)

@@ -1,4 +1,4 @@
-"""Live database tests for signed terminal archival."""
+"""Live database tests for archival, evidence review, and remediation handoffs."""
 
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -146,3 +146,88 @@ def test_archive_denial_is_atomic_for_each_invalid_signature(urls: tuple[str, st
             assert response.json()["reason"] == "HUMAN_SIGNATURE_REQUIRED"
             assert get_state(reader, engagement) == source
             assert read_ledger(reader, engagement, 0) == []
+
+
+@pytest.mark.parametrize(
+    ("source", "destination"),
+    [
+        (EngagementState.CONTROLLED_VALIDATION, EngagementState.EVIDENCE_VERIFICATION),
+        (EngagementState.DISCOVERY_PASSIVE, EngagementState.REMEDIATION_SYNTHESIS),
+        (EngagementState.ANALYTICAL_TRIAGE, EngagementState.REMEDIATION_SYNTHESIS),
+        (EngagementState.EVIDENCE_VERIFICATION, EngagementState.REMEDIATION_SYNTHESIS),
+        (EngagementState.RETEST_VERIFICATION, EngagementState.REMEDIATION_SYNTHESIS),
+    ],
+)
+def test_evidence_and_remediation_handoffs(
+    urls: tuple[str, str], source: EngagementState, destination: EngagementState,
+) -> None:
+    database, redis = urls
+    engagement = uuid4()
+    event = TransitionEvent(
+        engagement_id=str(engagement), event_id=str(uuid4()), from_state=source, to_state=destination,
+        actor_type=ActorType.HUMAN_OPERATOR, actor_id="report-reviewer", occurred_at=datetime.now(timezone.utc),
+    )
+    previous = GENESIS_HASH
+    with psycopg.connect(database) as connection:
+        connection.execute("INSERT INTO engagements (id, current_state) VALUES (%s, %s)", (engagement, source))
+        if source == EngagementState.EVIDENCE_VERIFICATION:
+            history = event.model_copy(update={
+                "event_id": str(uuid4()), "from_state": EngagementState.CONTROLLED_VALIDATION, "to_state": source,
+            })
+            previous = hash_record(GENESIS_HASH, history)
+            connection.execute(
+                """INSERT INTO immutable_audit_log (payload, prev_record_hash, record_hash)
+                   VALUES (%s::jsonb, %s, %s)""", (history.model_dump_json(), GENESIS_HASH, previous),
+            )
+
+    app = create_app(database_url=database, redis_url=redis, trusted_public_keys={})
+    with TestClient(app) as client:
+        path = f"/engagements/{engagement}/transition"
+        payload = event.model_dump(mode="json", exclude_none=True)
+        applied = client.post(path, json=payload)
+        assert applied.status_code == 200, applied.text
+        digest = hash_record(previous, event)
+        assert applied.json() == {"status": "applied", "next_state": destination.value, "ledger_hash": digest}
+
+        with psycopg.connect(database) as reader:
+            assert get_state(reader, engagement) == destination
+            records = read_ledger(reader, engagement, 0)
+        assert [r.record_hash for r in records] == ([previous, digest] if previous != GENESIS_HASH else [digest])
+        latest = records[-1]
+        assert latest.prev_record_hash == previous
+        assert latest.event == event
+
+        stale = client.post(path, json={**payload, "event_id": str(uuid4())})
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["reason"] == "STATE_MISMATCH"
+        with psycopg.connect(database) as reader:
+            assert get_state(reader, engagement) == destination
+            assert read_ledger(reader, engagement, 0) == records
+
+
+def test_remediation_preserves_and_checks_optional_signature(urls: tuple[str, str]) -> None:
+    database, redis = urls
+    engagement = uuid4()
+    source = EngagementState.EVIDENCE_VERIFICATION
+    with psycopg.connect(database) as db:
+        db.execute("INSERT INTO engagements (id, current_state) VALUES (%s, %s)", (engagement, source))
+
+    key = Ed25519PrivateKey.generate()
+    event = TransitionEvent(
+        event_id=str(uuid4()), engagement_id=str(engagement), from_state=source,
+        to_state=EngagementState.REMEDIATION_SYNTHESIS, actor_type=ActorType.HUMAN_OPERATOR,
+        actor_id="reviewer", occurred_at=datetime.now(timezone.utc),
+    )
+    signed = event.model_copy(update={"hitl_signature": Ed25519Signature(
+        signer_id=event.actor_id, signature=key.sign(event.canonical_envelope()).hex(),
+    )})
+    app = create_app(database_url=database, redis_url=redis, trusted_public_keys={event.actor_id: key.public_key()})
+    with TestClient(app) as client, psycopg.connect(database, autocommit=True) as reader:
+        payload = signed.model_dump(mode="json")
+        path = f"/engagements/{engagement}/transition"
+        denied = client.post(path, json={**payload, "event_id": str(uuid4())})
+        assert denied.status_code == 403 and denied.json()["reason"] == "INVALID_SIGNATURE"
+        assert get_state(reader, engagement) == source and not read_ledger(reader, engagement, 0)
+        assert client.post(path, json=payload).status_code == 200
+        record, = read_ledger(reader, engagement, 0)
+        assert record.event == signed
