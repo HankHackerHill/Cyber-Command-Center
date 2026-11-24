@@ -9,7 +9,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 import contracts
-from contracts.events import Ed25519Signature, TransitionEvent
+from contracts.events import AuditEvent, Ed25519Signature, RecordedAuditEvent, TransitionEvent
 from contracts.findings import AssetEdge, AssetNode, AttackChain, Finding, FindingStatus
 from contracts.ledger import LedgerRecord
 from contracts.plans import ValidationPlan
@@ -34,6 +34,15 @@ def examples() -> Iterator[BaseModel]:
     })
     yield event
     yield LedgerRecord(seq_id=1, event=event, prev_record_hash="0" * 64, record_hash="1" * 64)
+    audit = AuditEvent.model_validate({
+        "actor_kind": "SYSTEM", "actor_id": "scoped-proxy", "event_type": "TUNNEL_REJECTED",
+        "payload": {"reason": "CONNECT_UNINSPECTABLE"},
+    })
+    yield audit
+    yield RecordedAuditEvent.model_validate(dict(
+        audit.model_dump(), event_id="2cd7c35f-c5cd-4e9f-817c-00f0ce7fd2dd",
+        engagement_id="340a1421-c1d6-482c-9ed7-a363ffbb6913", occurred_at=event.occurred_at,
+    ))
     yield ValidationPlan.model_validate({
         "id": "plan-1", "engagement_id": engagement.id, "blast_radius": "READ_ONLY",
     })

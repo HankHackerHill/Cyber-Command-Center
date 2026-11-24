@@ -26,6 +26,10 @@ from redis import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from main import create_app
+from ledger import GENESIS_HASH, hash_record
+
+
+AUDIT_HEADERS = {"Authorization": "Bearer test-m4-service"}
 
 
 @pytest.fixture(scope="module")
@@ -40,7 +44,7 @@ def service_urls() -> tuple[str, str]:
 @pytest.fixture(scope="module")
 def client(service_urls: tuple[str, str]) -> Iterator[TestClient]:
     database, redis = service_urls
-    with TestClient(create_app(database_url=database, redis_url=redis)) as http:
+    with TestClient(create_app(database_url=database, redis_url=redis, m4_audit_token="test-m4-service")) as http:
         yield http
 
 
@@ -87,6 +91,7 @@ def test_state_ledger_and_exclusive_cursor(client: TestClient, service_urls: tup
     stop_hash(client, other)
     assert client.get(state_path).json()["state"] == "HALTED_KILLSWITCH"
     record, = ledger(client, first)
+    assert isinstance(record.event, TransitionEvent)
     assert record.event.engagement_id == str(first)
     assert record.event.from_state == EngagementState.INIT_SCOPING
     assert record.event.to_state == EngagementState.HALTED_KILLSWITCH
@@ -119,6 +124,7 @@ def test_every_running_state_can_be_halted(client: TestClient, service_urls: tup
     for engagement_id, state in zip(ids, states, strict=True):
         digest = stop_hash(client, engagement_id)
         record, = ledger(client, engagement_id)
+        assert isinstance(record.event, TransitionEvent)
         assert record.event.from_state == state
         assert record.record_hash == digest
 
@@ -267,6 +273,7 @@ def test_transition_to_stop_ignores_stale_source_and_retries_once(
         assert response.status_code == 200
         assert response.json()["notification_published"]
     stop, = ledger(client, engagement_id)
+    assert isinstance(stop.event, TransitionEvent)
     assert stop.event.from_state == EngagementState.INIT_SCOPING
     assert stop.event.to_state == EngagementState.HALTED_KILLSWITCH
     assert stop.record_hash == response.json()["ledger_hash"]
@@ -276,3 +283,107 @@ def test_transition_malformed_event_returns_reason(client: TestClient) -> None:
     response = client.post(f"/engagements/{uuid4()}/transition", json={})
     assert response.status_code == 422
     assert response.json()["reason"] == "INVALID_EVENT"
+
+
+def audit_body(**payload: object) -> dict[str, object]:
+    return {"actor_kind": "SYSTEM", "actor_id": "scoped-proxy",
+            "event_type": "TUNNEL_REJECTED", "payload": payload}
+
+
+def test_audit_receipt_replay_and_append_only(client: TestClient, service_urls: tuple[str, str]) -> None:
+    eid, other = engagements(service_urls[0], [EngagementState.INIT_SCOPING] * 2)
+    path = f"/engagements/{eid}/audit-events"
+    key = str(uuid4())
+    headers = {**AUDIT_HEADERS, "Idempotency-Key": key}
+    body = audit_body(reason="OPAQUE_TUNNEL_NOT_ALLOWED", prefix_hex="00ff", bit=True,
+                      numbers=[1e20, -0.0, 1.25e-105, 2**80 + 3], note="測試")
+    first = client.post(path, json=body, headers=headers)
+    assert first.status_code == 201, first.text
+    record = first.json()
+    assert set(record) == {"seq_id", "event", "prev_record_hash", "record_hash"}
+    assert record["prev_record_hash"] == GENESIS_HASH
+    assert record["event"]["event_id"] == key
+    assert record["event"]["engagement_id"] == str(eid)
+    assert datetime.fromisoformat(record["event"]["occurred_at"]).utcoffset() == timezone.utc.utcoffset(None)
+    assert record["event"]["payload"] == body["payload"]
+    assert "from_state" not in record["event"] and "to_state" not in record["event"]
+    replay = client.post(path, json=body, headers=headers)
+    assert replay.status_code == 200 and replay.json() == record
+    # JSON booleans and numbers are distinct even though True == 1 in Python.
+    conflicting = {**body, "payload": {**record["event"]["payload"], "bit": 1}}
+    assert client.post(path, json=conflicting, headers=headers).status_code == 409
+    assert client.get(f"/engagements/{eid}/state").json() == {"state": "INIT_SCOPING"}
+    assert client.get(f"/engagements/{eid}/ledger").json() == [record]
+    stored, = ledger(client, eid)
+    assert hash_record(GENESIS_HASH, stored.event) == stored.record_hash
+    assert client.post(f"/engagements/{other}/audit-events", json=body, headers=headers).status_code == 201
+    fresh = client.post(path, json=body, headers=AUDIT_HEADERS)
+    assert fresh.status_code == 201 and fresh.json()["event"]["event_id"] != key
+    with psycopg.connect(service_urls[0], autocommit=True) as conn:
+        assert conn.execute(
+            "SELECT payload->>'from_state', payload->>'to_state' FROM immutable_audit_log WHERE seq_id=%s",
+            (stored.seq_id,),
+        ).fetchone() == (None, None)
+        with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState, match="append-only"):
+            conn.execute("DELETE FROM immutable_audit_log WHERE seq_id=%s", (stored.seq_id,))
+
+
+def test_audit_rejects_bad_credentials_identity_and_wire(client: TestClient, service_urls: tuple[str, str]) -> None:
+    eid, = engagements(service_urls[0], [EngagementState.ROE_LOCKED])
+    path = f"/engagements/{eid}/audit-events"
+    body = audit_body(reason="POLICY_DENIED")
+    assert client.post(path, json=body).status_code == 401
+    assert client.post(path, json=body, headers={"Authorization": "Bearer wrong"}).status_code == 401
+    repeated_auth = [("Authorization", AUDIT_HEADERS["Authorization"])] * 2
+    assert client.post(path, json=body, headers=repeated_auth).status_code == 401
+    with TestClient(create_app(database_url=service_urls[0], redis_url=service_urls[1], m4_audit_token="")) as unconfigured:
+        assert unconfigured.post(path, json=body, headers=AUDIT_HEADERS).status_code == 401
+    for forged in ({"actor_kind": "HUMAN_OPERATOR"}, {"actor_id": "orchestrator:killswitch"}):
+        assert client.post(path, json={**body, **forged}, headers=AUDIT_HEADERS).status_code == 403
+    assert client.post(path, json={**body, "from_state": "ROE_LOCKED"}, headers=AUDIT_HEADERS).status_code == 422
+    duplicated = [*AUDIT_HEADERS.items(), ("Idempotency-Key", str(uuid4())), ("Idempotency-Key", str(uuid4()))]
+    assert client.post(path, json=body, headers=duplicated).status_code == 422
+    for field in ['"n":1e-400', '"n":NaN', '"n":Infinity', '"v":1,"v":2', '"v":"\\u0000"']:
+        wire = json.dumps(audit_body()).replace('"payload": {}', '"payload": {' + field + '}')
+        response = client.post(path, content=wire, headers={**AUDIT_HEADERS, "Content-Type": "application/json"})
+        assert response.status_code == 422, (wire, response.text)
+    assert client.post(f"/engagements/{uuid4()}/audit-events", json=body, headers=AUDIT_HEADERS).status_code == 404
+    assert ledger(client, eid) == []
+
+
+def test_interleaved_audit_and_transition_appends(client: TestClient, service_urls: tuple[str, str]) -> None:
+    eid, = engagements(service_urls[0], [EngagementState.EVIDENCE_VERIFICATION])
+    path = f"/engagements/{eid}/audit-events"
+    body = audit_body(reason="SCOPE_DENIED")
+    headers = {**AUDIT_HEADERS, "Idempotency-Key": str(uuid4())}
+    event = TransitionEvent(
+        engagement_id=str(eid), event_id=str(uuid4()), actor_id="reviewer", actor_type=ActorType.SYSTEM,
+        from_state=EngagementState.EVIDENCE_VERIFICATION, to_state=EngagementState.REMEDIATION_SYNTHESIS,
+        occurred_at=datetime.now(timezone.utc),
+    )
+    workers = 8
+    barrier = Barrier(workers, timeout=10)
+
+    def append(worker: int) -> int:
+        barrier.wait()
+        if worker == 0:
+            result = client.post(f"/engagements/{eid}/transition", json=event.model_dump(mode="json"))
+        else:
+            result = client.post(path, json=body, headers=headers)
+        return int(result.status_code)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        codes = list(executor.map(append, range(workers)))
+    assert codes[0] == 200
+    assert sorted(codes[1:]) == [200] * (workers - 2) + [201]
+    assert client.get(f"/engagements/{eid}/state").json() == {"state": "REMEDIATION_SYNTHESIS"}
+    stopped = stop_hash(client, eid)
+    assert client.post(path, json=body, headers=AUDIT_HEADERS).status_code == 201
+    assert stop_hash(client, eid) == stopped
+    records = ledger(client, eid)
+    assert len(records) == 4
+    previous = GENESIS_HASH
+    for entry in records:
+        assert entry.prev_record_hash == previous
+        assert hash_record(previous, entry.event) == entry.record_hash
+        previous = entry.record_hash

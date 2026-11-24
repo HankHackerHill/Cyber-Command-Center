@@ -9,6 +9,8 @@ export type Contract =
   | Engagement
   | RoeManifest
   | TransitionEvent
+  | AuditEvent
+  | RecordedAuditEvent
   | LedgerRecord
   | AssetNode
   | AssetEdge
@@ -92,9 +94,28 @@ export interface Ed25519Signature {
   signer_id: string;
   signature: string;
 }
+export interface AuditEvent {
+  actor_kind: ActorType;
+  actor_id: string;
+  event_type: string;
+  payload: {
+    [k: string]: JsonValue;
+  };
+}
+export interface RecordedAuditEvent {
+  actor_kind: ActorType;
+  actor_id: string;
+  event_type: string;
+  payload: {
+    [k: string]: JsonValue;
+  };
+  event_id: string;
+  engagement_id: string;
+  occurred_at: string;
+}
 export interface LedgerRecord {
   seq_id: number;
-  event: TransitionEvent;
+  event: TransitionEvent | RecordedAuditEvent;
   prev_record_hash: string;
   record_hash: string;
 }

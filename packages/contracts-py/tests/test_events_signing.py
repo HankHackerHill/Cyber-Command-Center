@@ -102,4 +102,5 @@ def test_ledger_payload_round_trip_preserves_signed_bytes() -> None:
     assert "event" not in storage
     restored = LedgerRecord.model_validate(storage)
     assert restored == LedgerRecord.model_validate(record.model_dump())
+    assert isinstance(restored.event, TransitionEvent)
     key.public_key().verify(bytes.fromhex(sig.signature), restored.event.canonical_envelope())
