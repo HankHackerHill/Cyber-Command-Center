@@ -18,6 +18,12 @@ and four workers per protocol. --profile runs
 diagnostic HTTP requests (64 by default) with four workers and proxy phase traces;
 its timings do not substitute for the acceptance benchmark. Process logs,
 test-only keys, CAS artifacts and a machine-readable result remain in work-dir.
+The fixture explicitly provisions a bounded 256-record/4-GiB proxy outbox by
+default (two maximum 8-MiB snapshots reserved per slot). --outbox-max-records
+and --outbox-max-bytes override these test limits. Capacity is not preallocated;
+the backing volume must support the configured bound. Service defaults and
+full-capacity fail-closed behavior are unchanged. Every accepted benchmark
+request still requires drained M7 delivery and an exactly-once ledger proof.
 No current_state updates occur outside M2; setup only inserts INIT_SCOPING.
 """
 from __future__ import annotations
@@ -306,7 +312,15 @@ def main() -> int:
                         help="run diagnostic HTTP requests at concurrency 4 with proxy phase traces")
     parser.add_argument("--profile-count", type=int, default=64, metavar="1..4096",
                         help="diagnostic request count (default: 64; maximum: 4096)")
+    parser.add_argument("--outbox-max-records", type=int, default=256, metavar="COUNT",
+                        help="bounded test-fixture proxy outbox record slots (default: 256)")
+    parser.add_argument("--outbox-max-bytes", type=int, default=4 * 1024**3, metavar="BYTES",
+                        help="bounded test-fixture proxy outbox bytes (default: 4294967296; 4 GiB)")
     args = parser.parse_args()
+    if args.outbox_max_records < 1:
+        parser.error("--outbox-max-records must be positive")
+    if args.outbox_max_bytes < 2 * 8 * 1024**2:
+        parser.error("--outbox-max-bytes must reserve at least one slot (16777216 bytes)")
     if not 1 <= args.profile_count <= 4096:
         parser.error("--profile-count must be between 1 and 4096")
     args.python = os.path.abspath(shutil.which(args.python) or args.python)
@@ -346,7 +360,10 @@ def main() -> int:
     processes = Processes(run)
     result: dict[str, object] = {"engagement_id": engagement, "run_dir": str(run),
         "fixture": profile["fixture_urn"], "fixture_sha256": hashlib.sha256(profile_raw).hexdigest(),
-        "status": "running"}
+        "status": "running", "proxy_outbox": {
+            "max_records": args.outbox_max_records, "max_bytes": args.outbox_max_bytes,
+            "effective_slots": min(args.outbox_max_records, args.outbox_max_bytes // (2 * 8 * 1024**2)),
+            "max_record_bytes": 8 * 1024**2, "snapshots_reserved_per_slot": 2}}
     try:
         with ExitStack() as stack:
             stack.callback(processes.close)
@@ -421,6 +438,8 @@ def main() -> int:
                 SCOPED_PROXY_WORKSPACE_DIR=str(workspace.parent),
                 SCOPED_PROXY_LISTEN=f"127.0.0.1:{proxy_port}", M4_AUDIT_TOKEN=audit_token,
                 SCOPED_PROXY_OUTBOX_DIR=str(run / "proxy-outbox"),
+                SCOPED_PROXY_OUTBOX_MAX_RECORDS=str(args.outbox_max_records),
+                SCOPED_PROXY_OUTBOX_MAX_BYTES=str(args.outbox_max_bytes),
                 ORCHESTRATOR_AUDIT_OUTBOX=str(run / "m2-audit.sqlite3"),
                 ORCHESTRATOR_OPERATOR_PUBLIC_KEYS=json.dumps({operator: public.hex()}),
                 PYTHONPATH=str(REPO / "packages/contracts-py"), PYTHONUNBUFFERED="1")

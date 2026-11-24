@@ -152,6 +152,11 @@ These internal measurements apply to the asynchronous benchmark configuration,
 not the legacy synchronous compatibility path.
 Logs, synthetic keys, artifacts, and `result.json` remain in a fresh run directory;
 service processes are stopped on exit. No live client system is contacted.
+The load fixture provisions 256 records and a 4 GiB outbox budget by default,
+configurable with `--outbox-max-records` and `--outbox-max-bytes`. This bounded
+budget is recorded in `result.json` and is not preallocated. It does not change
+the service defaults or signed worker cap; every accepted record must still
+drain and pass exact artifact and ledger verification.
 
 For a separate diagnostic run, use `--profile --profile-count 64` instead of
 `--benchmark`. It sends governed requests with four workers and verifies the
