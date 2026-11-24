@@ -26,6 +26,7 @@ from redis.exceptions import RedisError
 
 from audit_delivery import AuditDelivery, AuditOutbox, QueuedAudit, audit_receipt, lock_engagement
 from deps import Services, services
+from engagements import router as engagements_router
 from ledger import (
     AuditReplayConflict, EngagementNotFound, get_state, halt_engagement, read_ledger,
     record_audit_event, record_review_transition,
@@ -135,6 +136,7 @@ def create_app(
                         outbox.close()
 
     app = FastAPI(lifespan=lifespan)
+    app.include_router(engagements_router)
 
     @app.exception_handler(EngagementNotFound)
     async def missing_engagement(request: Request, exc: EngagementNotFound) -> JSONResponse:
@@ -142,7 +144,10 @@ def create_app(
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:
-        if getattr(request.scope.get("route"), "name", None) in ("transition", "append_audit"):
+        route_name = getattr(request.scope.get("route"), "name", None)
+        if route_name in ("create_engagement", "update_roe"):
+            return JSONResponse(status_code=422, content={"reason": Reason.INVALID_MANIFEST})
+        if route_name in ("transition", "append_audit"):
             return JSONResponse(status_code=422, content={"reason": Reason.INVALID_EVENT})
         return await request_validation_exception_handler(request, exc)
 
@@ -273,9 +278,9 @@ def create_app(
                 "model": TransitionError,
                 "description": "A required human signature is missing or invalid, or an optional signature is invalid.",
             },
-            404: {"model": TransitionError, "description": "Engagement not found."},
-            409: {"model": TransitionError, "description": "Illegal transition, stale source state, or reused transition event ID."},
-            422: {"model": TransitionError, "description": "Invalid event or mismatched engagement ID."},
+            404: {"model": TransitionError, "description": "Unknown engagement or approved plan."},
+            409: {"model": TransitionError, "description": "Illegal edge, stale state or plan hash, or reused event ID."},
+            422: {"model": TransitionError, "description": "Invalid event, mismatched engagement ID, or missing plan binding."},
         },
     )
     def transition(id: UUID, event: TransitionEvent, resources: Resources) -> ReviewResponse | StopResponse:
@@ -283,6 +288,8 @@ def create_app(
 
         Entry to ROE_LOCKED, CONTROLLED_VALIDATION, and COMPLETED_ARCHIVED
         requires a trusted human signature, including manual reset after a halt.
+        Entry to CONTROLLED_VALIDATION also binds the approval to the stored
+        plan in this engagement via approved_plan_id and approved_plan_hash.
         Applied transition event IDs cannot be reused within an engagement.
         Emergency stops use the idempotent killswitch handler regardless of the
         submitted source state.

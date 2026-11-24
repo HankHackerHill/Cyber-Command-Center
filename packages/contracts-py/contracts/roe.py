@@ -9,6 +9,7 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from .events import EngagementState
+from .events import Sha256Hex as Sha256Hex
 
 
 class AssessmentType(StrEnum):
@@ -22,7 +23,6 @@ class ExecutionMode(StrEnum):
     HYBRID = "HYBRID"
 
 
-Sha256Hex = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 Weekday = Literal["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 
 

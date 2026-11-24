@@ -56,6 +56,26 @@ def hash_record(previous_hash: str, event: TransitionEvent | RecordedAuditEvent)
     return hashlib.sha256(bytes.fromhex(previous_hash) + payload.encode("utf-8")).hexdigest()
 
 
+def _require_approved_plan(conn: Connection, engagement_id: UUID, event: TransitionEvent) -> None:
+    if event.approved_plan_id is None or event.approved_plan_hash is None:
+        raise TransitionDenied(Reason.PLAN_BINDING_REQUIRED, 422)
+    # The frozen composite key uses text for the plan ID. Resolve the signed
+    # UUID against its canonical spelling without casting unrelated legacy IDs.
+    row = conn.execute(
+        """SELECT to_jsonb(p) FROM validation_plans AS p
+           WHERE p.engagement_id = %s AND p.id = %s FOR SHARE""",
+        (engagement_id, str(event.approved_plan_id)),
+    ).fetchone()
+    if row is None:
+        raise TransitionDenied(Reason.PLAN_NOT_FOUND, 404)
+    # Lock the reviewed row through the state change and ledger commit. Hash
+    # every column, including both approval records and any explicit nulls.
+    canonical = json.dumps(row[0], sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                           allow_nan=False).encode("utf-8")
+    if hashlib.sha256(canonical).hexdigest() != event.approved_plan_hash:
+        raise TransitionDenied(Reason.PLAN_HASH_MISMATCH, 409)
+
+
 def _lock_engagement(conn: Connection, engagement_id: UUID) -> EngagementState:
     row = conn.execute(
         "SELECT current_state FROM engagements WHERE id = %s FOR UPDATE", (engagement_id,),
@@ -132,6 +152,9 @@ def record_review_transition(
         ).fetchone()
         if prior is not None:
             raise TransitionDenied(Reason.EVENT_REPLAY, 409)
+        if event.to_state == EngagementState.CONTROLLED_VALIDATION:
+            # The graph admits this target only from AWAITING_HITL_GATE.
+            _require_approved_plan(conn, engagement_id, event)
         previous = _tail_hash(conn, engagement_id) or GENESIS_HASH
         digest = hash_record(previous, event)
         conn.execute(
