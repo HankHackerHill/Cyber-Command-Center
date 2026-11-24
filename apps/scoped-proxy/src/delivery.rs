@@ -16,7 +16,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -42,6 +42,17 @@ struct State {
     blocked: HashSet<Uuid>,
     recovering: HashSet<Uuid>,
     pending_5xx: HashMap<Uuid, HashSet<Uuid>>,
+    delivery: DeliveryState,
+}
+#[derive(Default)]
+struct DeliveryState {
+    in_flight: HashSet<Uuid>,
+    handed_off: HashSet<Uuid>,
+    retries: HashMap<Uuid, (Instant, Duration)>,
+}
+struct DeliveryClaim {
+    record: Arc<Record>,
+    handed_off: bool,
 }
 struct Inner {
     dir: PathBuf,
@@ -53,6 +64,7 @@ struct Inner {
     // never wait for a filesystem operation or this writer lock.
     writer: Mutex<()>,
     state: Mutex<State>,
+    changed: tokio::sync::Notify,
 }
 #[derive(Clone)]
 pub struct Outbox(Arc<Inner>);
@@ -229,7 +241,9 @@ impl Outbox {
                 blocked,
                 recovering,
                 pending_5xx,
+                delivery: DeliveryState::default(),
             }),
+            changed: tokio::sync::Notify::new(),
         }))))
     }
 
@@ -342,6 +356,7 @@ impl Outbox {
             })
             .await;
             if matches!(written, Ok(Ok(()))) {
+                self.0.changed.notify_waiters();
                 return;
             }
             self.0.healthy.store(false, Ordering::Release);
@@ -398,19 +413,20 @@ impl Outbox {
             state.recovering.retain(|id| pending.contains(id));
         })
         .await;
+        self.0.changed.notify_waiters();
     }
 
-    async fn remove(&self, id: Uuid) {
+    async fn remove(&self, id: Uuid) -> Result<bool, OutboxUnavailable> {
         let this = self.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let _writer = this.0.writer.lock().unwrap();
             let Some(record) = this.0.state.lock().unwrap().records.get(&id).cloned() else {
-                return;
+                return Ok(true);
             };
             // Incomplete records are reconciliation receipts: preserve them
             // across restart even after their evidence and audit are durable.
             if record.status.is_none() || !record.settled {
-                return;
+                return Ok(false);
             }
             #[cfg(test)]
             tests::pause_io(&this.0.dir);
@@ -418,13 +434,116 @@ impl Outbox {
                 .and_then(|()| File::open(&this.0.dir)?.sync_all())
                 .is_ok()
             {
-                this.0.state.lock().unwrap().records.remove(&id);
+                let mut state = this.0.state.lock().unwrap();
+                state.records.remove(&id);
+                state.delivery.handed_off.remove(&id);
+                state.delivery.retries.remove(&id);
                 this.0.slots.add_permits(1);
+                Ok(true)
             } else {
                 this.0.healthy.store(false, Ordering::Release);
+                Err(OutboxUnavailable)
             }
         })
-        .await;
+        .await
+        .map_err(|_| OutboxUnavailable)?
+    }
+
+    fn claim_delivery(&self) -> (Option<DeliveryClaim>, Duration) {
+        let mut state = self.0.state.lock().unwrap();
+        let now = Instant::now();
+        let mut wait = Duration::from_secs(1);
+        let candidate = state.records.values().find_map(|record| {
+            let id = record.event_id;
+            if record.artifact.is_none() || state.delivery.in_flight.contains(&id) {
+                return None;
+            }
+            let handed_off = state.delivery.handed_off.contains(&id);
+            if handed_off && (record.status.is_none() || !record.settled) {
+                return None;
+            }
+            if let Some((retry_at, _)) = state.delivery.retries.get(&id)
+                && *retry_at > now
+            {
+                wait = wait.min(retry_at.saturating_duration_since(now));
+                return None;
+            }
+            Some(DeliveryClaim {
+                record: record.clone(),
+                handed_off,
+            })
+        });
+        if let Some(claim) = &candidate {
+            state.delivery.in_flight.insert(claim.record.event_id);
+        }
+        (candidate, wait)
+    }
+
+    fn finish_claim(&self, id: Uuid, failed: bool) {
+        let mut state = self.0.state.lock().unwrap();
+        state.delivery.in_flight.remove(&id);
+        if failed && state.records.contains_key(&id) {
+            let delay = state
+                .delivery
+                .retries
+                .get(&id)
+                .map_or(Duration::from_millis(20), |(_, previous)| {
+                    previous.saturating_mul(2).min(Duration::from_secs(1))
+                });
+            state
+                .delivery
+                .retries
+                .insert(id, (Instant::now() + delay, delay));
+        } else {
+            state.delivery.retries.remove(&id);
+        }
+        drop(state);
+        self.0.changed.notify_waiters();
+    }
+
+    async fn deliver_claim(
+        &self,
+        claim: DeliveryClaim,
+        evidence: &EvidenceClient,
+        policy: &PolicyClient,
+    ) {
+        let record = claim.record;
+        let acknowledged = claim.handed_off
+            || (evidence
+                .put(Bytes::from(
+                    record
+                        .artifact
+                        .as_ref()
+                        .expect("claimed finalized artifact")
+                        .clone(),
+                ))
+                .await
+                .is_ok()
+                && policy
+                    .audit_event_durable(
+                        record.engagement_id,
+                        record.event_id,
+                        &record.event_type,
+                        record.audit_payload.clone(),
+                    )
+                    .await
+                    .is_ok());
+        let failed = if acknowledged {
+            // This memo avoids duplicate uploads while waiting for M3. It is
+            // intentionally volatile: restart re-proves the same immutable
+            // handoff using the persisted artifact and idempotency key.
+            self.0
+                .state
+                .lock()
+                .unwrap()
+                .delivery
+                .handed_off
+                .insert(record.event_id);
+            record.status.is_some() && self.remove(record.event_id).await.is_err()
+        } else {
+            true
+        };
+        self.finish_claim(record.event_id, failed);
     }
 
     pub fn start(
@@ -452,14 +571,18 @@ impl Outbox {
                     // Keep confirmation bodies inside PolicyClient's 8KiB
                     // bounded JSON parser even though M3 permits 256 items.
                     for batch in records.chunks(64) {
-                        let _accounting_guard = gate.lock().await;
                         let completions: Vec<_> = batch
                             .iter()
                             .map(|r| (r.reservation, r.status.unwrap()))
                             .collect();
-                        if let Ok(committed) =
+                        let confirmation = {
+                            let _accounting_guard = gate.lock().await;
                             accounting_policy.settle_batch(id, &completions).await
-                        {
+                        };
+                        // M3 has finished its atomic mutation. Local fsync may
+                        // wait for the writer without holding admission; 5xx
+                        // barriers remain latched until mark_settled persists.
+                        if let Ok(committed) = confirmation {
                             accounting
                                 .mark_settled(
                                     batch
@@ -475,51 +598,26 @@ impl Outbox {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         });
-        let delivery = self.clone();
-        tokio::spawn(async move {
-            let mut delivered_incomplete = HashSet::new();
-            loop {
-                let records = delivery.ready();
-                use futures_util::{StreamExt, stream};
-                let results: Vec<_> = stream::iter(
-                    records
-                        .into_iter()
-                        .filter(|r| !delivered_incomplete.contains(&r.event_id)),
-                )
-                .map(|record| {
-                    let evidence = evidence.clone();
-                    let policy = policy.clone();
-                    let delivery = delivery.clone();
-                    async move {
-                        if evidence
-                            .put(Bytes::from(record.artifact.as_ref().unwrap().clone()))
-                            .await
-                            .is_ok()
-                            && policy
-                                .audit_event_durable(
-                                    record.engagement_id,
-                                    record.event_id,
-                                    &record.event_type,
-                                    record.audit_payload.clone(),
-                                )
-                                .await
-                                .is_ok()
-                        {
-                            if record.status.is_none() {
-                                return Some(record.event_id);
-                            }
-                            delivery.remove(record.event_id).await;
-                        }
-                        None
+        for _ in 0..8 {
+            let delivery = self.clone();
+            let evidence = evidence.clone();
+            let policy = policy.clone();
+            tokio::spawn(async move {
+                loop {
+                    // Register before checking state so a finish/settlement
+                    // notification cannot race the transition to sleeping.
+                    let notified = delivery.0.changed.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    let (claim, wait) = delivery.claim_delivery();
+                    if let Some(claim) = claim {
+                        delivery.deliver_claim(claim, &evidence, &policy).await;
+                    } else {
+                        tokio::select! { () = &mut notified => (), () = tokio::time::sleep(wait) => () }
                     }
-                })
-                .buffer_unordered(8)
-                .collect()
-                .await;
-                delivered_incomplete.extend(results.into_iter().flatten());
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        });
+                }
+            });
+        }
     }
 }
 
@@ -655,7 +753,9 @@ mod tests {
                 blocked: HashSet::new(),
                 recovering: HashSet::new(),
                 pending_5xx: HashMap::new(),
+                delivery: DeliveryState::default(),
             }),
+            changed: tokio::sync::Notify::new(),
         }))
     }
 
@@ -730,7 +830,9 @@ mod tests {
                 .unwrap();
         assert!(durable.settled);
         let writer = outbox.clone();
-        blocked_io(&outbox, async move { writer.remove(id).await }).await;
+        blocked_io(&outbox, async move { writer.remove(id).await })
+            .await
+            .unwrap();
         assert!(outbox.0.state.lock().unwrap().records.is_empty());
         assert!(!outbox.0.dir.join(format!("{id}.json")).exists());
         fs::remove_dir_all(&outbox.0.dir).unwrap();

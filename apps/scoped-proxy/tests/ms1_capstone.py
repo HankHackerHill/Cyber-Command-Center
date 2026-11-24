@@ -24,6 +24,9 @@ and --outbox-max-bytes override these test limits. Capacity is not preallocated;
 the backing volume must support the configured bound. Service defaults and
 full-capacity fail-closed behavior are unchanged. Every accepted benchmark
 request still requires drained M7 delivery and an exactly-once ledger proof.
+A completed load run that fails only latency gates still drains and verifies all
+accepted requests, records functional/performance outcomes separately, and exits
+unsuccessfully after the durable proof.
 No current_state updates occur outside M2; setup only inserts INIT_SCOPING.
 """
 from __future__ import annotations
@@ -38,6 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -612,6 +616,7 @@ def main() -> int:
                 result["profile"]["ledger_tail"] = tail
                 print("Diagnostic profile: " + json.dumps(result["profile"]), flush=True)
             if args.benchmark:
+                result.update(functional_status="incomplete", performance_status="incomplete")
                 benchmark_env = dict(env, M4_LOAD_PROXY_ADDR=f"127.0.0.1:{proxy_port}",
                     M4_LOAD_ENGAGEMENT_ID=engagement, M4_LOAD_CA_PEM=str(workspace / "ca.pem"),
                     M4_LOAD_ORIGIN_CERT_PEM=str(cert), M4_LOAD_ORIGIN_KEY_PEM=str(key),
@@ -636,10 +641,38 @@ def main() -> int:
                 summaries = [json.loads(line.removeprefix("M4_LOAD_RESULT ")) for line in output.splitlines()
                              if line.startswith("M4_LOAD_RESULT ")]
                 result["benchmark"] = {"protocols": summaries, "returncode": benchmark.returncode,
-                    "timing_source": str(run / "proxy-internal.jsonl"), "log": str(path)}
-                require(benchmark.returncode == 0, f"benchmark failed; see {path}")
-                require(len(summaries) == 2 and {summary["protocol"] for summary in summaries} == {"http", "https"}
-                        and all(summary["passed"] for summary in summaries), "both protocol gate summaries required")
+                    "status": "incomplete", "timing_source": str(run / "proxy-internal.jsonl"), "log": str(path)}
+                require(len(summaries) == 2 and {summary["protocol"] for summary in summaries} == {"http", "https"},
+                        f"both complete protocol summaries required; see {path}")
+                expected_phases = [("warmup", 64), ("measured_1", 1000), ("measured_2", 1000), ("measured_3", 1000)]
+                for summary in summaries:
+                    phases = summary["phases"]
+                    require(summary["concurrency"] == 4 and len(phases) == 4
+                            and [(phase["phase"], phase["requests"]) for phase in phases] == expected_phases,
+                            "complete benchmark phase counts required")
+                    require(all(isinstance(phase[metric], (int, float)) and math.isfinite(phase[metric])
+                                and phase[metric] >= 0 for phase in phases
+                                for metric in ("e2e_p99_ms", "internal_p99_ms")), "invalid benchmark latency metric")
+                    e2e = sorted(phase["e2e_p99_ms"] for phase in phases[1:])[1]
+                    internal = max(phase["internal_p99_ms"] for phase in phases[1:])
+                    passed = e2e < 50 and internal < 15
+                    require(summary["e2e_median_measured_p99_ms"] == e2e
+                            and summary["internal_max_measured_p99_ms"] == internal
+                            and summary["e2e_gate_ms"] == 50 and summary["internal_gate_ms"] == 15
+                            and summary["passed"] is passed, "benchmark gate summary disagrees with phase metrics")
+                performance_passed = all(summary["passed"] for summary in summaries)
+                result["performance_status"] = "passed" if performance_passed else "failed"
+                # A final latency assertion happens only after all requests and reports.
+                # Preserve its failure while allowing the accepted async work to drain.
+                latency_assertion_only = (benchmark.returncode == 101 and not performance_passed
+                    and "thread 'governed_http_and_inspected_https_latency_gates'" in output
+                    and "latency gates failed:" in output
+                    and "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out;" in output)
+                require((benchmark.returncode == 0 and performance_passed) or latency_assertion_only,
+                        f"benchmark execution failed before durable proof; see {path}")
+                proofs = [json.loads(line) for line in (run / "benchmark-proofs.jsonl").read_text().splitlines()]
+                expected_proofs = {proof["uri"]: proof["body_hex"] for proof in proofs}
+                require(len(proofs) == len(expected_proofs) == 6128, "complete unique benchmark fixture proofs")
                 expected = 2 + (args.profile_count if args.profile else 0) + 2 * (64 + 3 * 1000)
                 final_records = await_delivery(processes, state_url, expected, redis, accounting_key,
                                               run / "proxy-outbox", timeout=180)
@@ -650,9 +683,6 @@ def main() -> int:
                 reservations: set[str] = set()
                 tail = "0" * 64
                 benchmark_protocols = {"http": 0, "https": 0}
-                proofs = [json.loads(line) for line in (run / "benchmark-proofs.jsonl").read_text().splitlines()]
-                expected_proofs = {proof["uri"]: proof["body_hex"] for proof in proofs}
-                require(len(proofs) == len(expected_proofs) == 6128, "complete unique benchmark fixture proofs")
                 for raw_record in final_records:
                     record = LedgerRecord.model_validate(raw_record)
                     event = record.event
@@ -699,9 +729,14 @@ def main() -> int:
                     durable_rows = connection.execute("SELECT count(*) FROM immutable_audit_log WHERE engagement_id=%s",
                                                        (engagement,)).fetchone()[0]
                 require(durable_rows == len(final_records), "benchmark API/Postgres cardinality")
-                result["benchmark"].update(delivery_drained=True, ledger_rows=len(final_records),
-                    ledger_tail=tail, evidenced_requests=benchmark_protocols)
+                result["benchmark"].update(status="passed" if performance_passed else "failed",
+                    functional_status="passed", performance_status=result["performance_status"],
+                    delivery_drained=True, ledger_rows=len(final_records), ledger_tail=tail,
+                    evidenced_requests=benchmark_protocols)
+                result["functional_status"] = "passed"
                 result["checks"].append("benchmark_every_request_durable_evidence_and_hash_chain")
+                require(performance_passed,
+                        f"benchmark latency gates failed after complete durable delivery verification; see {path}")
             processes.check()
     except BaseException:
         result["status"] = "failed"

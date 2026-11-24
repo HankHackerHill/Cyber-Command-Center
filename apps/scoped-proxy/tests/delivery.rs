@@ -68,6 +68,116 @@ async fn blocked_remote_evidence_does_not_delay_locally_durable_origin_response(
 }
 
 #[tokio::test]
+async fn slow_remote_job_does_not_block_new_ready_job_on_available_delivery_worker() {
+    timeout(LIMIT, async {
+        let fixture = Fixture::start(128).await;
+        fixture.seen.lock().unwrap().hold_first_evidence = true;
+        assert_eq!(fixture.request().await.body, RESPONSE);
+        eventually(|| fixture.seen.lock().unwrap().evidence_gates.len() == 1).await;
+        let first = records(&fixture.outbox).pop().unwrap();
+        let first_id = first["event_id"].as_str().unwrap().to_owned();
+        let raw = first["artifact"].as_str().unwrap().as_bytes().to_vec();
+        assert_eq!(fixture.request().await.body, RESPONSE);
+        timeout(
+            Duration::from_secs(1),
+            eventually(|| {
+                let seen = fixture.seen.lock().unwrap();
+                seen.ledger.len() == 1
+                    && !seen.ledger.contains_key(&first_id)
+                    && records(&fixture.outbox).len() == 1
+            }),
+        )
+        .await
+        .expect("a blocked remote job prevented a newly ready job from using an available worker");
+        {
+            let seen = fixture.seen.lock().unwrap();
+            assert!(!seen.ledger.contains_key(&first_id));
+            assert_eq!(seen.evidence_gates.len(), 1);
+            assert_eq!(seen.origin_connections, 2);
+        }
+        assert_eq!(records(&fixture.outbox)[0]["event_id"], first_id);
+        let gate = {
+            let mut seen = fixture.seen.lock().unwrap();
+            seen.hold_first_evidence = false;
+            seen.evidence_gates.remove(&first_id).unwrap()
+        };
+        gate.notify_one();
+        eventually(|| records(&fixture.outbox).is_empty()).await;
+        let seen = fixture.seen.lock().unwrap();
+        assert_eq!(seen.ledger.len(), 2);
+        assert_eq!(seen.completed.len(), 2);
+        let digest = format!("{:x}", Sha256::digest(&raw));
+        assert_eq!(seen.ledger[&first_id]["payload"]["evidence_sha256"], digest);
+        assert!(
+            seen.artifacts
+                .iter()
+                .filter(|bytes| {
+                    serde_json::from_slice::<Value>(bytes).unwrap()["event_id"] == first_id
+                })
+                .all(|bytes| bytes == &raw)
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn remote_delivery_has_at_most_eight_in_flight_jobs_and_reuses_freed_worker() {
+    timeout(LIMIT, async {
+        let fixture = Fixture::start(128).await;
+        fixture.seen.lock().unwrap().hold_all_evidence = true;
+        let responses = futures_util::future::join_all((0..9).map(|_| fixture.request())).await;
+        assert!(responses.iter().all(|response| response.body == RESPONSE));
+        timeout(
+            Duration::from_secs(1),
+            eventually(|| fixture.seen.lock().unwrap().evidence_gates.len() == 8),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        {
+            let seen = fixture.seen.lock().unwrap();
+            assert_eq!(
+                seen.artifacts.len(),
+                8,
+                "remote delivery exceeded its eight-worker bound"
+            );
+            assert_eq!(seen.evidence_gates.len(), 8);
+            assert!(seen.ledger.is_empty());
+        }
+        assert_eq!(records(&fixture.outbox).len(), 9);
+        let gate = {
+            let mut seen = fixture.seen.lock().unwrap();
+            let id = seen.evidence_gates.keys().next().unwrap().clone();
+            seen.evidence_gates.remove(&id).unwrap()
+        };
+        gate.notify_one();
+        timeout(
+            Duration::from_secs(1),
+            eventually(|| fixture.seen.lock().unwrap().artifacts.len() == 9),
+        )
+        .await
+        .expect("ninth ready job did not reuse a freed worker");
+        let gates = {
+            let mut seen = fixture.seen.lock().unwrap();
+            seen.hold_all_evidence = false;
+            std::mem::take(&mut seen.evidence_gates)
+        };
+        for gate in gates.into_values() {
+            gate.notify_one();
+        }
+        eventually(|| records(&fixture.outbox).is_empty()).await;
+        let seen = fixture.seen.lock().unwrap();
+        assert_eq!(seen.ledger.len(), 9);
+        assert_eq!(seen.completed.len(), 9);
+        assert!(seen.receipts.is_empty());
+        assert_eq!(seen.artifacts.len(), 9);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn restart_replays_exact_binary_evidence_with_stable_digest_and_event_id() {
     timeout(LIMIT, async {
         let mut fixture = Fixture::start(128).await;

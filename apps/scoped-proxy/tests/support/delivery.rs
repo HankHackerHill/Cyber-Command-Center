@@ -114,6 +114,9 @@ pub struct Observed {
     pub audit_ack_event_id: Option<String>,
     pub lose_audit_ack: bool,
     pub hold_evidence: bool,
+    pub hold_first_evidence: bool,
+    pub hold_all_evidence: bool,
+    pub evidence_gates: HashMap<String, Arc<tokio::sync::Notify>>,
     pub origin_status: u16,
     pub stall_origin: bool,
     pub hold_origin_response: bool,
@@ -142,6 +145,9 @@ impl Default for Observed {
             audit_ack_event_id: None,
             lose_audit_ack: false,
             hold_evidence: false,
+            hold_first_evidence: false,
+            hold_all_evidence: false,
+            evidence_gates: HashMap::new(),
             origin_status: 200,
             stall_origin: false,
             hold_origin_response: false,
@@ -163,6 +169,7 @@ async fn control(listener: TcpListener, kind: &'static str, seen: Seen) {
                 return;
             };
             let mut headers = Vec::new();
+            let mut evidence_gate = None;
             let (status, body, drop_ack, hold) = {
                 let mut state = seen.lock().unwrap();
                 match kind {
@@ -248,6 +255,15 @@ async fn control(listener: TcpListener, kind: &'static str, seen: Seen) {
                     }
                     "evidence" => {
                         assert_eq!(wire.line, "PUT /artifacts HTTP/1.1");
+                        let artifact: Value = serde_json::from_slice(&wire.body).unwrap();
+                        let id = artifact["event_id"].as_str().unwrap().to_owned();
+                        if state.hold_all_evidence
+                            || state.evidence_gates.contains_key(&id)
+                            || (state.hold_first_evidence && state.evidence_gates.is_empty())
+                        {
+                            evidence_gate =
+                                Some(state.evidence_gates.entry(id).or_default().clone());
+                        }
                         state.artifacts.push(wire.body);
                         (
                             state.evidence_status,
@@ -259,6 +275,9 @@ async fn control(listener: TcpListener, kind: &'static str, seen: Seen) {
                     _ => unreachable!(),
                 }
             };
+            if let Some(gate) = evidence_gate {
+                gate.notified().await;
+            }
             if hold {
                 std::future::pending::<()>().await;
             }
