@@ -1,0 +1,33 @@
+{
+  "version": "1.0.0",
+  "prompt_sha256": "6c45d3d84572a25485975eca8c209389cd12da189caf13fe4b9412993e033b5e",
+  "output": {
+    "findings": [
+      {
+        "code": "recorded_path_priority",
+        "evidence_ref": "graph_review",
+        "confidence_score": 0.9
+      }
+    ]
+  },
+  "input": {
+    "artifacts": [
+      {
+        "ref": "graph_review",
+        "data": {
+          "source": "graph_service_summary",
+          "sensitive_boundary_affected": true,
+          "corroborated": true
+        }
+      },
+      {
+        "ref": "decoy",
+        "data": {
+          "source": "graph_service_summary",
+          "sensitive_boundary_affected": false,
+          "corroborated": true
+        }
+      }
+    ]
+  }
+}

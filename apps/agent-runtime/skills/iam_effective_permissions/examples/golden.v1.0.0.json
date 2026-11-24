@@ -1,0 +1,31 @@
+{
+  "version": "1.0.0",
+  "prompt_sha256": "d7c19539ad58270e4b30297b74f06d7f675d691ee48b831440a2ec666741ef16",
+  "output": {
+    "findings": [
+      {
+        "code": "broad_permission",
+        "evidence_ref": "iam_review",
+        "confidence_score": 0.9
+      }
+    ]
+  },
+  "input": {
+    "artifacts": [
+      {
+        "ref": "iam_review",
+        "data": {
+          "effective_review_complete": true,
+          "exceeds_job_need": true
+        }
+      },
+      {
+        "ref": "decoy",
+        "data": {
+          "effective_review_complete": true,
+          "exceeds_job_need": false
+        }
+      }
+    ]
+  }
+}

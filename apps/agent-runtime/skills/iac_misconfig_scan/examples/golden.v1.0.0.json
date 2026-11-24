@@ -1,0 +1,31 @@
+{
+  "version": "1.0.0",
+  "prompt_sha256": "0ec6978a1ff6c87f75538b07372f736e1ccc1871f3400a5aed0f25ebee4d9526",
+  "output": {
+    "findings": [
+      {
+        "code": "permissive_configuration",
+        "evidence_ref": "storage_review",
+        "confidence_score": 0.9
+      }
+    ]
+  },
+  "input": {
+    "artifacts": [
+      {
+        "ref": "storage_review",
+        "data": {
+          "observed_access": "public",
+          "approved_access": "private"
+        }
+      },
+      {
+        "ref": "decoy",
+        "data": {
+          "observed_access": "private",
+          "approved_access": "private"
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "version": "1.0.0",
+  "prompt_sha256": "e1e8c041bef9c24195d9be43ce1dd3dd450cd3ea882d49f2c6c93e49b08bf489",
+  "output": {
+    "findings": [
+      {
+        "code": "duplicate_observations",
+        "evidence_ref": "duplicate_review",
+        "confidence_score": 0.9
+      }
+    ]
+  },
+  "input": {
+    "artifacts": [
+      {
+        "ref": "duplicate_review",
+        "data": {
+          "same_asset": true,
+          "same_issue_family": true,
+          "fingerprint_match": true
+        }
+      },
+      {
+        "ref": "decoy",
+        "data": {
+          "same_asset": false,
+          "same_issue_family": true,
+          "fingerprint_match": true
+        }
+      }
+    ]
+  }
+}

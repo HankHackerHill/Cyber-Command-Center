@@ -1,0 +1,33 @@
+{
+  "version": "1.0.0",
+  "prompt_sha256": "8d502ca5a32a851916906563959d2afd04d5e7cadf5d1e7331ba26aa9d64d7ce",
+  "output": {
+    "findings": [
+      {
+        "code": "recorded_tier0_exposure",
+        "evidence_ref": "tier0_review",
+        "confidence_score": 0.9
+      }
+    ]
+  },
+  "input": {
+    "artifacts": [
+      {
+        "ref": "tier0_review",
+        "data": {
+          "source": "graph_service_summary",
+          "tier0_reachability_recorded": true,
+          "outside_approved_boundary": true
+        }
+      },
+      {
+        "ref": "decoy",
+        "data": {
+          "source": "graph_service_summary",
+          "tier0_reachability_recorded": true,
+          "outside_approved_boundary": false
+        }
+      }
+    ]
+  }
+}

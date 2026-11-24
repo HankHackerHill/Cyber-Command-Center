@@ -1,0 +1,33 @@
+{
+  "version": "1.0.0",
+  "prompt_sha256": "054038d633a3ed2ebe83783f043d74f6d929c7f565ef7263aba817c34dcbb774",
+  "output": {
+    "findings": [
+      {
+        "code": "related_control_gaps",
+        "evidence_ref": "controls_review",
+        "confidence_score": 0.9
+      }
+    ]
+  },
+  "input": {
+    "artifacts": [
+      {
+        "ref": "controls_review",
+        "data": {
+          "independent_sources": 2,
+          "same_control_boundary": true,
+          "association_documented": true
+        }
+      },
+      {
+        "ref": "decoy",
+        "data": {
+          "independent_sources": 1,
+          "same_control_boundary": true,
+          "association_documented": true
+        }
+      }
+    ]
+  }
+}

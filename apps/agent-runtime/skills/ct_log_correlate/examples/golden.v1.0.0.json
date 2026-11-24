@@ -1,0 +1,31 @@
+{
+  "version": "1.0.0",
+  "prompt_sha256": "ebf96532c6b6c4c76d527753b71b1b8409990b7987f812d24b91f22360ccbad6",
+  "output": {
+    "findings": [
+      {
+        "code": "unmatched_certificate",
+        "evidence_ref": "cert_inventory",
+        "confidence_score": 0.9
+      }
+    ]
+  },
+  "input": {
+    "artifacts": [
+      {
+        "ref": "cert_inventory",
+        "data": {
+          "inventory_match": false,
+          "current": true
+        }
+      },
+      {
+        "ref": "decoy",
+        "data": {
+          "inventory_match": false,
+          "current": false
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "version": "1.0.0",
+  "prompt_sha256": "e07641a1970e243f73075a6a4d912e3d38a0cdfbfcd410da61afd04cd362898f",
+  "output": {
+    "findings": [
+      {
+        "code": "missing_auth_requirement",
+        "evidence_ref": "openapi_review",
+        "confidence_score": 0.9
+      }
+    ]
+  },
+  "input": {
+    "artifacts": [
+      {
+        "ref": "openapi_review",
+        "data": {
+          "in_scope": true,
+          "documentation_complete": true,
+          "authorization_documented": false
+        }
+      },
+      {
+        "ref": "decoy",
+        "data": {
+          "in_scope": false,
+          "documentation_complete": true,
+          "authorization_documented": false
+        }
+      }
+    ]
+  }
+}

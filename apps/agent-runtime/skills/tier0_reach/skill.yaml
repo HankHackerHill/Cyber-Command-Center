@@ -1,0 +1,14 @@
+{
+  "name": "tier0_reach",
+  "version": "1.0.0",
+  "agent": "graph",
+  "input_schema": "workers:ArtifactInput",
+  "output_schema": "workers.graph:Tier0ReachOutput",
+  "token_budget": {
+    "input_tokens": 12000,
+    "output_tokens": 1024
+  },
+  "fixtures": [
+    "examples/golden.v1.0.0.json"
+  ]
+}

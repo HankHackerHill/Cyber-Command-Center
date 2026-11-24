@@ -1,0 +1,33 @@
+{
+  "version": "1.0.0",
+  "prompt_sha256": "bf31dac7b7f339f1aa7e553676138a10b39afca1e3b4de2bad8769d26d459035",
+  "output": {
+    "findings": [
+      {
+        "code": "proposed_control_change",
+        "evidence_ref": "patch_review",
+        "confidence_score": 0.9
+      }
+    ]
+  },
+  "input": {
+    "artifacts": [
+      {
+        "ref": "patch_review",
+        "data": {
+          "defensive_behavior_stated": true,
+          "regression_coverage_stated": true,
+          "human_review_pending": true
+        }
+      },
+      {
+        "ref": "decoy",
+        "data": {
+          "defensive_behavior_stated": true,
+          "regression_coverage_stated": true,
+          "human_review_pending": false
+        }
+      }
+    ]
+  }
+}

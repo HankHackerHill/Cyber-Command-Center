@@ -1,0 +1,33 @@
+{
+  "version": "1.0.0",
+  "prompt_sha256": "fc83c935ea5ccf988fea2f702aaba041a5b6df365a19241d659d44396cec751e",
+  "output": {
+    "findings": [
+      {
+        "code": "exposed_service_observation",
+        "evidence_ref": "service_inventory",
+        "confidence_score": 0.9
+      }
+    ]
+  },
+  "input": {
+    "artifacts": [
+      {
+        "ref": "service_inventory",
+        "data": {
+          "externally_observed": true,
+          "service_role": "management",
+          "expected_exposure": false
+        }
+      },
+      {
+        "ref": "decoy",
+        "data": {
+          "externally_observed": true,
+          "service_role": "management",
+          "expected_exposure": true
+        }
+      }
+    ]
+  }
+}

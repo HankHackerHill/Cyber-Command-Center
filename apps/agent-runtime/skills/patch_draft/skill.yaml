@@ -1,0 +1,14 @@
+{
+  "name": "patch_draft",
+  "version": "1.0.0",
+  "agent": "remediation",
+  "input_schema": "workers:ArtifactInput",
+  "output_schema": "workers.remediation:PatchDraftOutput",
+  "token_budget": {
+    "input_tokens": 12000,
+    "output_tokens": 1024
+  },
+  "fixtures": [
+    "examples/golden.v1.0.0.json"
+  ]
+}

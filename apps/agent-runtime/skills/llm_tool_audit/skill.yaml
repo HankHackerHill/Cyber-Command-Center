@@ -1,0 +1,14 @@
+{
+  "name": "llm_tool_audit",
+  "version": "1.0.0",
+  "agent": "audit",
+  "input_schema": "workers.audit:LlmToolAuditInput",
+  "output_schema": "workers.audit:LlmToolAuditOutput",
+  "token_budget": {
+    "input_tokens": 12000,
+    "output_tokens": 1024
+  },
+  "fixtures": [
+    "examples/golden.v1.0.0.json"
+  ]
+}

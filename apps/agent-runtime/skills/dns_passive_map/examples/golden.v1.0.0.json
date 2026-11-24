@@ -1,0 +1,31 @@
+{
+  "version": "1.0.0",
+  "prompt_sha256": "9d0f7f9908735d710d7e90b1d48d698828ebfd27971b29f9d5f665c5f92f1ed1",
+  "output": {
+    "findings": [
+      {
+        "code": "conflicting_dns_observation",
+        "evidence_ref": "dns_inventory",
+        "confidence_score": 0.9
+      }
+    ]
+  },
+  "input": {
+    "artifacts": [
+      {
+        "ref": "dns_inventory",
+        "data": {
+          "record_observed": true,
+          "approved_mapping_conflicts": true
+        }
+      },
+      {
+        "ref": "decoy",
+        "data": {
+          "record_observed": false,
+          "approved_mapping_conflicts": true
+        }
+      }
+    ]
+  }
+}
