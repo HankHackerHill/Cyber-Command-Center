@@ -90,13 +90,33 @@ the captured result for retry. After repairing storage, restart only after
 retained records have been verified; the local unhealthy latch does not silently
 resume admission.
 
-Successful final statuses are batched through M3's authenticated settlement API;
-workers are released only on confirmed, idempotent commit. A newly observed 5xx
-immediately blocks later evaluations until its shared cumulative count commits.
+Confirmed final statuses are batched through M3's authenticated settlement API;
+workers are released only on confirmed, idempotent commit. M3 atomically retains
+the reservation/status fingerprint with worker release and cumulative 5xx
+accounting. The proxy publishes this proof in memory without rewriting the local
+exchange record or waiting for unrelated outbox I/O. A newly observed 5xx
+immediately blocks later evaluations until that exact M3 commit is confirmed.
+The accounting gate is released after M3 responds; local evidence delivery and
+cleanup do not hold the admission gate.
 Evaluations that already started under the fair accounting gate may finish with
 their existing reservation; this preserves the original in-flight ordering and
 worker cap. The local consecutive breaker remains prompt and independent of
 delivery retries. This is not a new cross-replica ordering guarantee.
+
+New finalized records retain `settled: false` on disk. If a process stops after
+M3 commits but before local deletion, restart conservatively blocks the recovered
+engagement and retries the same reservation/status against M3's durable
+fingerprint before restoring admission or permitting deletion. A lost M3 response
+has the same recovery path. Older records with a durable `settled: true` hint
+remain compatible. Deletion still requires confirmed settlement, acknowledged M7
+storage, and authenticated M2 durable handoff, and fsyncs the directory after
+unlink. The artifact bytes and audit idempotency key remain unchanged.
+
+Eight independent background workers wake on finalized records and settlement
+confirmations. Exclusive per-record claims prevent duplicate concurrent delivery;
+a slow remote job does not hold other ready jobs. Retries use bounded per-record
+backoff while retaining the durable record. A process restart re-proves remote
+handoffs rather than relying on volatile delivery bookkeeping.
 
 Enable `ORCHESTRATOR_AUDIT_OUTBOX` in M2 and the same trusted M4 observer credential
 in M3. Both delivery queues must use persistent storage; M2's participating

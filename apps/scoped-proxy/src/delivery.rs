@@ -33,6 +33,8 @@ pub struct Record {
     pub request: Value,
     pub artifact: Option<String>,
     pub status: Option<u16>,
+    // Legacy durable hint. New records remain false on disk; current-process
+    // M3 confirmations live in State.settled and are re-proved after restart.
     pub settled: bool,
     pub event_type: String,
     pub audit_payload: Value,
@@ -42,6 +44,7 @@ struct State {
     blocked: HashSet<Uuid>,
     recovering: HashSet<Uuid>,
     pending_5xx: HashMap<Uuid, HashSet<Uuid>>,
+    settled: HashSet<Uuid>,
     delivery: DeliveryState,
 }
 #[derive(Default)]
@@ -241,6 +244,7 @@ impl Outbox {
                 blocked,
                 recovering,
                 pending_5xx,
+                settled: HashSet::new(),
                 delivery: DeliveryState::default(),
             }),
             changed: tokio::sync::Notify::new(),
@@ -367,52 +371,50 @@ impl Outbox {
         }
     }
 
-    fn ready(&self) -> Vec<Arc<Record>> {
-        self.0
-            .state
-            .lock()
-            .unwrap()
+    fn unsettled(&self) -> Vec<Arc<Record>> {
+        let state = self.0.state.lock().unwrap();
+        state
             .records
             .values()
-            .filter(|r| r.artifact.is_some())
+            .filter(|r| {
+                r.artifact.is_some()
+                    && r.status.is_some()
+                    && !r.settled
+                    && !state.settled.contains(&r.event_id)
+            })
             .cloned()
             .collect()
     }
 
-    async fn mark_settled(&self, ids: Vec<Uuid>) {
-        let this = self.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let _writer = this.0.writer.lock().unwrap();
-            for id in ids {
-                let Some(old) = this.0.state.lock().unwrap().records.get(&id).cloned() else {
-                    continue;
-                };
-                let mut record = (*old).clone();
-                record.settled = true;
-                if atomic_write(&this.0.dir, &record).is_err() {
-                    this.0.healthy.store(false, Ordering::Release);
-                    continue;
-                }
-                let mut state = this.0.state.lock().unwrap();
-                state.records.insert(id, Arc::new(record));
-                let record = state.records[&id].clone();
-                if let Some(pending) = state.pending_5xx.get_mut(&record.engagement_id) {
-                    pending.remove(&record.reservation);
-                    if pending.is_empty() {
-                        state.pending_5xx.remove(&record.engagement_id);
-                    }
+    /// Only exact committed IDs from M3's durable receipt/status fingerprints
+    /// reach this method. Publishing that proof needs no second local WAL:
+    /// the finalized record stays on disk, and restart conservatively retries
+    /// the same M3 fingerprint before allowing admission or deletion.
+    fn mark_settled(&self, ids: Vec<Uuid>) {
+        let mut state = self.0.state.lock().unwrap();
+        for id in ids {
+            let Some(record) = state.records.get(&id).cloned() else {
+                continue;
+            };
+            if record.status.is_none() {
+                continue;
+            }
+            state.settled.insert(id);
+            if let Some(pending) = state.pending_5xx.get_mut(&record.engagement_id) {
+                pending.remove(&record.reservation);
+                if pending.is_empty() {
+                    state.pending_5xx.remove(&record.engagement_id);
                 }
             }
-            let mut state = this.0.state.lock().unwrap();
-            let pending: HashSet<_> = state
-                .records
-                .values()
-                .filter(|r| r.status.is_some() && !r.settled)
-                .map(|r| r.engagement_id)
-                .collect();
-            state.recovering.retain(|id| pending.contains(id));
-        })
-        .await;
+        }
+        let pending: HashSet<_> = state
+            .records
+            .values()
+            .filter(|r| r.status.is_some() && !r.settled && !state.settled.contains(&r.event_id))
+            .map(|r| r.engagement_id)
+            .collect();
+        state.recovering.retain(|id| pending.contains(id));
+        drop(state);
         self.0.changed.notify_waiters();
     }
 
@@ -420,12 +422,17 @@ impl Outbox {
         let this = self.clone();
         tokio::task::spawn_blocking(move || {
             let _writer = this.0.writer.lock().unwrap();
-            let Some(record) = this.0.state.lock().unwrap().records.get(&id).cloned() else {
-                return Ok(true);
+            let (record, settled) = {
+                let state = this.0.state.lock().unwrap();
+                let Some(record) = state.records.get(&id).cloned() else {
+                    return Ok(true);
+                };
+                let settled = record.settled || state.settled.contains(&id);
+                (record, settled)
             };
             // Incomplete records are reconciliation receipts: preserve them
             // across restart even after their evidence and audit are durable.
-            if record.status.is_none() || !record.settled {
+            if record.status.is_none() || !settled {
                 return Ok(false);
             }
             #[cfg(test)]
@@ -436,6 +443,7 @@ impl Outbox {
             {
                 let mut state = this.0.state.lock().unwrap();
                 state.records.remove(&id);
+                state.settled.remove(&id);
                 state.delivery.handed_off.remove(&id);
                 state.delivery.retries.remove(&id);
                 this.0.slots.add_permits(1);
@@ -459,7 +467,9 @@ impl Outbox {
                 return None;
             }
             let handed_off = state.delivery.handed_off.contains(&id);
-            if handed_off && (record.status.is_none() || !record.settled) {
+            if handed_off
+                && (record.status.is_none() || (!record.settled && !state.settled.contains(&id)))
+            {
                 return None;
             }
             if let Some((retry_at, _)) = state.delivery.retries.get(&id)
@@ -557,11 +567,7 @@ impl Outbox {
         tokio::spawn(async move {
             loop {
                 let mut groups: HashMap<Uuid, Vec<Arc<Record>>> = HashMap::new();
-                for record in accounting
-                    .ready()
-                    .into_iter()
-                    .filter(|r| !r.settled && r.status.is_some())
-                {
+                for record in accounting.unsettled() {
                     groups.entry(record.engagement_id).or_default().push(record);
                 }
                 for (id, records) in groups {
@@ -579,19 +585,17 @@ impl Outbox {
                             let _accounting_guard = gate.lock().await;
                             accounting_policy.settle_batch(id, &completions).await
                         };
-                        // M3 has finished its atomic mutation. Local fsync may
-                        // wait for the writer without holding admission; 5xx
-                        // barriers remain latched until mark_settled persists.
+                        // M3 has finished its atomic mutation. Publish only
+                        // that exact proof in memory; pending 5xx barriers
+                        // clear without waiting for local filesystem I/O.
                         if let Ok(committed) = confirmation {
-                            accounting
-                                .mark_settled(
-                                    batch
-                                        .iter()
-                                        .filter(|r| committed.contains(&r.reservation))
-                                        .map(|r| r.event_id)
-                                        .collect(),
-                                )
-                                .await;
+                            accounting.mark_settled(
+                                batch
+                                    .iter()
+                                    .filter(|r| committed.contains(&r.reservation))
+                                    .map(|r| r.event_id)
+                                    .collect(),
+                            );
                         }
                     }
                 }
@@ -718,6 +722,19 @@ mod tests {
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        blocked_io_observing(outbox, operation, || {}).await
+    }
+
+    async fn blocked_io_observing<F, P>(
+        outbox: &Outbox,
+        operation: F,
+        while_blocked: P,
+    ) -> F::Output
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+        P: FnOnce(),
+    {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         IO_GATES.lock().unwrap().insert(
@@ -732,6 +749,7 @@ mod tests {
         // The operation owns the writer and has reached the actual disk-I/O
         // boundary. Holding State here would reproduce the killswitch stall.
         assert_runtime_state_responsive(outbox);
+        while_blocked();
         IO_GATES.lock().unwrap().remove(&outbox.0.dir);
         release_tx.send(()).unwrap();
         operation.await.unwrap()
@@ -753,6 +771,7 @@ mod tests {
                 blocked: HashSet::new(),
                 recovering: HashSet::new(),
                 pending_5xx: HashMap::new(),
+                settled: HashSet::new(),
                 delivery: DeliveryState::default(),
             }),
             changed: tokio::sync::Notify::new(),
@@ -823,18 +842,83 @@ mod tests {
                 .unwrap();
         assert_eq!(durable.artifact.as_deref(), Some(expected.as_str()));
         assert!(!durable.settled);
-        let writer = outbox.clone();
-        blocked_io(&outbox, async move { writer.mark_settled(vec![id]).await }).await;
+        outbox.mark_settled(vec![id]);
         let durable: Record =
             serde_json::from_slice(&fs::read(outbox.0.dir.join(format!("{id}.json"))).unwrap())
                 .unwrap();
-        assert!(durable.settled);
+        assert!(
+            !durable.settled,
+            "M3 proof must not rewrite the finalized artifact record"
+        );
+        assert!(outbox.0.state.lock().unwrap().settled.contains(&id));
         let writer = outbox.clone();
         blocked_io(&outbox, async move { writer.remove(id).await })
             .await
             .unwrap();
         assert!(outbox.0.state.lock().unwrap().records.is_empty());
+        outbox.mark_settled(vec![id]);
+        assert!(
+            !outbox.0.state.lock().unwrap().settled.contains(&id),
+            "late proof resurrected a deleted job"
+        );
         assert!(!outbox.0.dir.join(format!("{id}.json")).exists());
+        fs::remove_dir_all(&outbox.0.dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirmed_m3_settlement_clears_barrier_without_waiting_for_paused_writer_io() {
+        let outbox = outbox();
+        let engagement = Uuid::new_v4();
+        let reservation = Uuid::new_v4();
+        let request = json!({"method":"GET","host":"localhost","body_hex":"00ff"});
+        let id = outbox
+            .begin(
+                engagement,
+                reservation,
+                request.clone(),
+                outbox.try_reserve(engagement).unwrap(),
+            )
+            .await
+            .unwrap();
+        outbox.observe_status(engagement, reservation, 503);
+        outbox.finish(id, Some(json!({"engagement_id":engagement,"event_id":id,"reservation":reservation,"request":request,"response":{"status":503,"body_hex":"80ff","complete":true}}).to_string()), Some(503), "").await;
+        outbox.0.state.lock().unwrap().recovering.insert(engagement);
+        assert!(outbox.admission_blocked(engagement));
+        let durable_before = fs::read(outbox.0.dir.join(format!("{id}.json"))).unwrap();
+        let second_engagement = Uuid::new_v4();
+        let slot = outbox.try_reserve(second_engagement).unwrap();
+        let writer = outbox.clone();
+        blocked_io_observing(
+            &outbox,
+            async move {
+                writer
+                    .begin(
+                        second_engagement,
+                        Uuid::new_v4(),
+                        json!({"method":"GET"}),
+                        slot,
+                    )
+                    .await
+                    .unwrap()
+            },
+            || {
+                let started = std::time::Instant::now();
+                outbox.mark_settled(vec![id]);
+                assert!(
+                    started.elapsed() < Duration::from_millis(50),
+                    "M3 proof waited for unrelated writer I/O"
+                );
+                assert!(!outbox.admission_blocked(engagement));
+                assert!(outbox.unsettled().is_empty());
+                assert_eq!(
+                    fs::read(outbox.0.dir.join(format!("{id}.json"))).unwrap(),
+                    durable_before
+                );
+                let durable: Record = serde_json::from_slice(&durable_before).unwrap();
+                assert!(!durable.settled);
+            },
+        )
+        .await;
         fs::remove_dir_all(&outbox.0.dir).unwrap();
     }
 
