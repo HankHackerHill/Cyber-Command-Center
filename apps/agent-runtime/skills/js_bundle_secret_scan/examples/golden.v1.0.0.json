@@ -1,0 +1,33 @@
+{
+  "version": "1.0.0",
+  "prompt_sha256": "818b9ea9c7431a56fbde9d94620578149a0e4b6be035300fc7551113328bb373",
+  "output": {
+    "findings": [
+      {
+        "code": "redacted_secret_indicator",
+        "evidence_ref": "bundle_review",
+        "confidence_score": 0.9
+      }
+    ]
+  },
+  "input": {
+    "artifacts": [
+      {
+        "ref": "bundle_review",
+        "data": {
+          "distributed_bundle": true,
+          "redacted": true,
+          "indicator_class": "confidential"
+        }
+      },
+      {
+        "ref": "decoy",
+        "data": {
+          "distributed_bundle": true,
+          "redacted": true,
+          "indicator_class": "public_config"
+        }
+      }
+    ]
+  }
+}

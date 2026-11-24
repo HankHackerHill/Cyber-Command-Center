@@ -1,0 +1,14 @@
+{
+  "name": "iam_effective_permissions",
+  "version": "1.0.0",
+  "agent": "audit",
+  "input_schema": "workers:ArtifactInput",
+  "output_schema": "workers.audit:IamEffectivePermissionsOutput",
+  "token_budget": {
+    "input_tokens": 12000,
+    "output_tokens": 1024
+  },
+  "fixtures": [
+    "examples/golden.v1.0.0.json"
+  ]
+}

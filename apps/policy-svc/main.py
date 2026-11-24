@@ -11,11 +11,12 @@ import re
 import secrets
 import time
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from collections.abc import AsyncIterator, Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import asynccontextmanager, contextmanager, nullcontext
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 from typing import TypedDict
 from uuid import UUID, uuid4
 
@@ -75,6 +76,38 @@ class Bucket(BaseModel):
     rate: int = Field(ge=0)
     active_workers: int = Field(ge=0)
     errors_5xx: int = Field(ge=0)
+
+
+class AuthorityChecks:
+    """Bound both active state HTTP calls and submitted jobs within this app."""
+
+    def __init__(self, executor: ThreadPoolExecutor, workers: int) -> None:
+        self.executor = executor
+        self.slots = BoundedSemaphore(workers)
+
+    @contextmanager
+    def pending(self, check: Callable[[], Decision | None]) -> Iterator[Future[Decision | None]]:
+        def fail_closed() -> Decision | None:
+            try:
+                return check()
+            except Exception:
+                # A failed authority task can never become an admission proof.
+                return Decision(reason="STATE_UNAVAILABLE")
+
+        self.slots.acquire()
+        try:
+            try:
+                future = self.executor.submit(fail_closed)
+            except RuntimeError as exc:
+                raise InvalidInput("authority executor unavailable") from exc
+            try:
+                yield future
+            finally:
+                # Every request drains its own HTTP operation, including on a
+                # failed policy query, denied window, or reservation CAS error.
+                future.result()
+        finally:
+            self.slots.release()
 
 
 class AccountStore:
@@ -192,36 +225,52 @@ class AccountStore:
 
     def reserve(
         self, engagement_id: str, capacity: int, judge: Callable[[Runtime], Decision],
+        *, authority: AuthorityChecks | None = None,
+        state_check: Callable[[], Decision | None] | None = None,
+        allow_recheck: Callable[[Runtime, Decision], Decision] | None = None,
     ) -> tuple[Decision, str | None]:
+        if (authority is None) != (state_check is None):
+            raise InvalidInput("incomplete authority configuration")
         key = self._key(engagement_id)
         for _ in range(12):
             raw, bucket, now = self._admission_snapshot(key)
             if now < bucket.at_us:
                 return Decision(reason="CLOCK_UNAVAILABLE"), None
-            # At a rate change, refill elapsed time at the more restrictive rate.
-            credit = capacity * 1_000_000
-            if bucket.rate:
-                earned = (now - bucket.at_us) * min(capacity, bucket.rate)
-                credit = min(credit, bucket.credit + earned)
-            decision = judge(Runtime(tokens=credit // 1_000_000, active_workers=bucket.active_workers,
-                                     errors_5xx=bucket.errors_5xx))
-            if not decision.allow:
-                return decision, None
-            if credit < 1_000_000:
-                return Decision(reason="RATE_DENIED"), None
-            updated = Bucket(credit=credit - 1_000_000, at_us=now, rate=capacity,
-                             active_workers=bucket.active_workers + 1, errors_5xx=bucket.errors_5xx)
-            receipt = str(uuid4())
-            # Compare the exact snapshot evaluated by Rego. A competing change
-            # requires a new decision before any counters are written.
-            stored = self._update(
-                "if redis.call('HGET', KEYS[1], 'state') ~= ARGV[1] then return 'retry' end "
-                "if redis.call('HEXISTS', KEYS[1], ARGV[3]) == 1 then return 'retry' end "
-                "redis.call('HSET', KEYS[1], 'state', ARGV[2], ARGV[3], '1') return 'ok'",
-                key, raw, updated.model_dump_json(), receipt,
-            )
-            if stored == "ok":
-                return decision, receipt
+            # Preserve authority freshness: start M2 only after validated Redis
+            # accounting and its clock, then overlap M2 with OPA evaluation.
+            context = authority.pending(state_check) if authority is not None and state_check is not None else nullcontext(None)
+            with context as pending:
+                # At a rate change, refill elapsed time at the more restrictive rate.
+                credit = capacity * 1_000_000
+                if bucket.rate:
+                    earned = (now - bucket.at_us) * min(capacity, bucket.rate)
+                    credit = min(credit, bucket.credit + earned)
+                runtime = Runtime(tokens=credit // 1_000_000, active_workers=bucket.active_workers,
+                                  errors_5xx=bucket.errors_5xx)
+                decision = judge(runtime)
+                if pending is not None:
+                    denied = pending.result()
+                    if denied is not None:
+                        return denied, None
+                if decision.allow and allow_recheck is not None:
+                    decision = allow_recheck(runtime, decision)
+                if not decision.allow:
+                    return decision, None
+                if credit < 1_000_000:
+                    return Decision(reason="RATE_DENIED"), None
+                updated = Bucket(credit=credit - 1_000_000, at_us=now, rate=capacity,
+                                 active_workers=bucket.active_workers + 1, errors_5xx=bucket.errors_5xx)
+                receipt = str(uuid4())
+                # Compare the exact snapshot evaluated by Rego. A competing change
+                # requires a new decision before any counters are written.
+                stored = self._update(
+                    "if redis.call('HGET', KEYS[1], 'state') ~= ARGV[1] then return 'retry' end "
+                    "if redis.call('HEXISTS', KEYS[1], ARGV[3]) == 1 then return 'retry' end "
+                    "redis.call('HSET', KEYS[1], 'state', ARGV[2], ARGV[3], '1') return 'ok'",
+                    key, raw, updated.model_dump_json(), receipt,
+                )
+                if stored == "ok":
+                    return decision, receipt
         return Decision(reason="ACCOUNTING_BUSY"), None
 
     def complete(self, engagement_id: str, reservation_id: str, status_code: int) -> bool:
@@ -497,12 +546,15 @@ def create_app(
             httpx.Client(base_url=opa_url or os.environ["OPA_URL"], trust_env=False, timeout=2) as opa,
             Redis.from_url(redis_url or os.environ["REDIS_URL"], decode_responses=True,
                            socket_connect_timeout=2, socket_timeout=2) as redis,
+            # Close/drain the executor before closing its HTTP dependencies.
+            ThreadPoolExecutor(max_workers=8, thread_name_prefix="policy-authority") as executor,
         ):
             app.state.directory = directory
             app.state.orchestrator = orchestrator
             app.state.opa = opa
             app.state.accounting = AccountStore(redis, time_us=time_us)
             app.state.decision_cache = DecisionCache()
+            app.state.authority = AuthorityChecks(executor, workers=8)
             yield
 
     app = FastAPI(lifespan=lifespan)
@@ -565,11 +617,12 @@ def create_app(
         if manifest.execution_mode == ExecutionMode.AUTONOMOUS_PASSIVE:
             return Decision(reason="PASSIVE_ONLY")
 
+        opa_sample: datetime | None = None
+
         def judge(runtime: Runtime) -> Decision:
-            denied = check_state(services.orchestrator, manifest.engagement_id)
-            if denied is not None:
-                return denied
+            nonlocal opa_sample
             now = utc_now()
+            opa_sample = now
             if now.utcoffset() is None:
                 return Decision(reason="CLOCK_UNAVAILABLE")
             if cache.scope_denied(evaluation.manifest_hash, evaluation.request):
@@ -578,10 +631,30 @@ def create_app(
             cache.remember(evaluation.manifest_hash, evaluation.request, decision)
             return decision
 
+        def recheck_window(runtime: Runtime, allowed: Decision) -> Decision:
+            # M2 may finish after the initial OPA result. Reuse that result only
+            # where its window truth is unchanged: forward UTC time, same date,
+            # still before the contract end minus one microsecond. This only
+            # triggers a fresh OPA call, tolerating either parse rounding mode.
+            # OPA keeps all actual boundary authority, including original
+            # nanoseconds.
+            fresh = utc_now()
+            if opa_sample is None or fresh.utcoffset() is None or opa_sample.utcoffset() is None:
+                return check_rules(services.opa, document, evaluation.request, fresh, runtime)
+            current = fresh.astimezone(timezone.utc)
+            previous = opa_sample.astimezone(timezone.utc)
+            if (current < previous or current.date() != previous.date()
+                    or current >= manifest.valid_window.not_after - timedelta(microseconds=1)):
+                return check_rules(services.opa, document, evaluation.request, fresh, runtime)
+            return allowed
+
         store: AccountStore = services.accounting
         try:
             decision, reservation = store.reserve(
                 manifest.engagement_id, manifest.traffic_constraints.max_requests_per_second, judge,
+                authority=services.authority,
+                state_check=lambda: check_state(services.orchestrator, manifest.engagement_id),
+                allow_recheck=recheck_window,
             )
         except (RedisError, ValueError):
             return Decision(reason="ACCOUNTING_UNAVAILABLE")

@@ -1,0 +1,33 @@
+{
+  "version": "1.0.0",
+  "prompt_sha256": "68d98990953616b5e16e9b29a4f4f2837e30909855830e2ac09c36a4b26b2bb0",
+  "output": {
+    "findings": [
+      {
+        "code": "insufficient_evidence",
+        "evidence_ref": "confidence_review",
+        "confidence_score": 0.9
+      }
+    ]
+  },
+  "input": {
+    "artifacts": [
+      {
+        "ref": "confidence_review",
+        "data": {
+          "asserted_confidence": "high",
+          "evidence_quality": "low",
+          "independent_corroboration": false
+        }
+      },
+      {
+        "ref": "decoy",
+        "data": {
+          "asserted_confidence": "low",
+          "evidence_quality": "low",
+          "independent_corroboration": false
+        }
+      }
+    ]
+  }
+}

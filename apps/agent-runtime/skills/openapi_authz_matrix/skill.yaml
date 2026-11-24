@@ -1,0 +1,14 @@
+{
+  "name": "openapi_authz_matrix",
+  "version": "1.0.0",
+  "agent": "audit",
+  "input_schema": "workers:ArtifactInput",
+  "output_schema": "workers.audit:OpenapiAuthzMatrixOutput",
+  "token_budget": {
+    "input_tokens": 60000,
+    "output_tokens": 1024
+  },
+  "fixtures": [
+    "examples/golden.v1.0.0.json"
+  ]
+}

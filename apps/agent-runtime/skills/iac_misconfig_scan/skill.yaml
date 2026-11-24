@@ -1,0 +1,14 @@
+{
+  "name": "iac_misconfig_scan",
+  "version": "1.0.0",
+  "agent": "audit",
+  "input_schema": "workers:ArtifactInput",
+  "output_schema": "workers.audit:IacMisconfigScanOutput",
+  "token_budget": {
+    "input_tokens": 12000,
+    "output_tokens": 1024
+  },
+  "fixtures": [
+    "examples/golden.v1.0.0.json"
+  ]
+}

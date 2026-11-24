@@ -1,0 +1,31 @@
+{
+  "version": "1.0.0",
+  "prompt_sha256": "da980a8cb3a05238ae9daf48e5d7ef792d02efcb9ef8c3a6b0c62cc43a304b6b",
+  "output": {
+    "findings": [
+      {
+        "code": "evidence_control_gap",
+        "evidence_ref": "compliance_review",
+        "confidence_score": 0.9
+      }
+    ]
+  },
+  "input": {
+    "artifacts": [
+      {
+        "ref": "compliance_review",
+        "data": {
+          "mapping_approved": true,
+          "evidence_status": "missing"
+        }
+      },
+      {
+        "ref": "decoy",
+        "data": {
+          "mapping_approved": false,
+          "evidence_status": "missing"
+        }
+      }
+    ]
+  }
+}

@@ -225,6 +225,102 @@ async fn restart_replays_exact_binary_evidence_with_stable_digest_and_event_id()
 }
 
 #[tokio::test]
+async fn restart_reproves_memory_only_settlement_before_admission_or_job_deletion() {
+    timeout(LIMIT, async {
+        let mut fixture = Fixture::start(128).await;
+        {
+            let mut seen = fixture.seen.lock().unwrap();
+            seen.origin_status = 503;
+            seen.hold_evidence = true;
+        }
+        let response = fixture.request().await;
+        assert!(response.line.contains("503"));
+        assert_eq!(response.body, RESPONSE);
+        eventually(|| fixture.seen.lock().unwrap().completed.len() == 1).await;
+        // A harmless malformed-target probe reaches 400 only after the proxy
+        // has published the confirmed settlement and cleared its 5xx barrier.
+        fixture.wait_admission_available().await;
+        let pending = records(&fixture.outbox).pop().unwrap();
+        assert_eq!(
+            pending["settled"], false,
+            "settlement should be reconstructed from M3 after restart"
+        );
+        assert_eq!(pending["status"], 503);
+        let event_id = pending["event_id"].as_str().unwrap().to_owned();
+        let reservation = pending["reservation"].clone();
+        let raw = pending["artifact"].as_str().unwrap().as_bytes().to_vec();
+        let attempts_before_crash = fixture.seen.lock().unwrap().settlement_attempts.len();
+        fixture.crash().await;
+        {
+            let mut seen = fixture.seen.lock().unwrap();
+            assert!(
+                seen.ledger.is_empty(),
+                "test crash occurred after remote audit handoff"
+            );
+            assert_eq!(seen.errors_5xx, 1);
+            seen.hold_evidence = false;
+            seen.settlement_status = 202;
+        }
+        fixture.restart().await;
+        eventually(|| {
+            let seen = fixture.seen.lock().unwrap();
+            seen.settlement_attempts.len() > attempts_before_crash
+                && seen.ledger.contains_key(&event_id)
+        })
+        .await;
+        let denied = fixture.request().await;
+        assert!(
+            denied.line.contains("503")
+                && String::from_utf8_lossy(&denied.body).contains("OUTBOX_UNAVAILABLE"),
+            "recovery admitted target traffic before M3 reconfirmation: {denied:?}"
+        );
+        let retained = records(&fixture.outbox);
+        assert_eq!(
+            retained.len(),
+            1,
+            "M7/M2 handoff alone deleted a job without reconstructed settlement proof"
+        );
+        assert_eq!(retained[0]["event_id"], event_id);
+        assert_eq!(retained[0]["settled"], false);
+        {
+            let seen = fixture.seen.lock().unwrap();
+            assert_eq!(seen.evaluations, 1);
+            assert_eq!(
+                seen.origin_connections, 1,
+                "restart replayed origin traffic"
+            );
+            assert_eq!(seen.completed.len(), 1);
+            assert_eq!(seen.errors_5xx, 1);
+            assert!(
+                seen.settlement_attempts.iter().all(|attempt| {
+                    attempt["completions"].as_array().unwrap().len() == 1
+                        && attempt["completions"][0]["reservation_id"] == reservation
+                        && attempt["completions"][0]["status_code"] == 503
+                }),
+                "recovery changed the receipt/status fingerprint"
+            );
+        }
+        fixture.seen.lock().unwrap().settlement_status = 200;
+        eventually(|| records(&fixture.outbox).is_empty()).await;
+        fixture.wait_admission_available().await;
+        let seen = fixture.seen.lock().unwrap();
+        assert_eq!(seen.ledger.len(), 1);
+        assert_eq!(seen.completed.len(), 1);
+        assert_eq!(seen.errors_5xx, 1);
+        assert_eq!(seen.origin_connections, 1);
+        assert!(seen.receipts.is_empty());
+        assert_eq!(
+            seen.ledger[&event_id]["payload"]["evidence_sha256"],
+            format!("{:x}", Sha256::digest(&raw))
+        );
+        assert!(seen.artifacts.iter().all(|bytes| bytes == &raw));
+        assert!(seen.audit_attempts.iter().all(|(id, _)| id == &event_id));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn crash_after_remote_append_before_local_ack_reuses_the_same_event() {
     timeout(LIMIT, async {
         let mut fixture = Fixture::start(128).await;

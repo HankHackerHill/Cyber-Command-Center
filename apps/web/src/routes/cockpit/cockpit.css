@@ -1,0 +1,159 @@
+.cockpit-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+  gap: 1rem;
+}
+
+.cockpit-stack {
+  display: grid;
+  gap: .95rem;
+}
+
+.cockpit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .65rem;
+}
+
+.cockpit-create {
+  margin-top: 1rem;
+  border-top: 1px solid var(--border, #293343);
+  padding-top: 1rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .75rem;
+}
+
+.cockpit-create p, .cockpit-ledger-entry p, .cockpit-kbd {
+  margin: 0;
+  font-size: .82rem;
+}
+
+.cockpit-state-value {
+  display: flex;
+  align-items: center;
+  gap: .68rem;
+  margin: .9rem 0 .48rem;
+  min-width: 0;
+}
+
+.cockpit-state-value strong {
+  font-size: clamp(1.1rem, 1.05rem + .5vw, 1.55rem);
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.cockpit-indicator {
+  flex: 0 0 .63rem;
+  height: .63rem;
+  border-radius: 50%;
+  background: var(--accent, #64d7bd);
+}
+
+.cockpit-indicator--halted {
+  background: var(--danger, #fa8898);
+}
+
+.cockpit-engagement-id {
+  overflow-wrap: anywhere;
+  margin: 0 0 1.4rem;
+  font-size: .82rem;
+}
+
+.cockpit-kbd {
+  margin-top: .8rem;
+}
+
+.cockpit-kbd kbd {
+  padding: .08rem .27rem;
+  border: 1px solid var(--border, #293343);
+  border-radius: .25rem;
+  font-size: .76rem;
+}
+
+.cockpit-ledger {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.cockpit-ledger-entry {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  column-gap: .8rem;
+  row-gap: .4rem;
+  padding: .7rem 0;
+  overflow-wrap: anywhere;
+}
+
+.cockpit-ledger-entry + .cockpit-ledger-entry {
+  border-top: 1px solid var(--border, #293343);
+}
+
+.cockpit-ledger-entry:last-child {
+  padding-bottom: 0;
+}
+
+.cockpit-ledger-entry p {
+  margin-top: .2rem;
+}
+
+.cockpit-ledger-entry > span {
+  font-size: .8rem;
+}
+
+.cockpit-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: .9rem;
+}
+
+.cockpit-fieldset {
+  padding: 0;
+  margin: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.cockpit-fieldset legend {
+  font-size: .88rem;
+  font-weight: 600;
+  margin-bottom: .35rem;
+}
+
+.cockpit-check {
+  display: flex;
+  align-items: baseline;
+  gap: .42rem;
+  font-size: .88rem;
+}
+
+.cockpit-check input[type='checkbox'] {
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--accent, #64d7bd);
+  flex: 0 0 auto;
+}
+
+.cockpit-details summary {
+  width: fit-content;
+  cursor: pointer;
+  font-weight: 600;
+  padding: .45rem 0;
+}
+
+.cockpit-draft-form, .cockpit-draft-preview, .cockpit-signature-form {
+  margin-top: .95rem;
+}
+
+.cockpit-error {
+  border-color: var(--danger, #fa8898);
+}
+
+@media (max-width: 760px) {
+  .cockpit-grid, .cockpit-form-grid { grid-template-columns: minmax(0, 1fr); }
+}

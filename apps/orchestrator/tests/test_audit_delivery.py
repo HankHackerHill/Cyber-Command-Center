@@ -4,14 +4,16 @@ import os
 import sqlite3
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from time import monotonic, sleep
 from uuid import UUID, uuid4
 from typing import cast
 
 import psycopg
+from psycopg_pool import ConnectionPool, TooManyRequests
 import pytest
 from contracts.events import ActorType, AuditEvent, Ed25519Signature, EngagementState, TransitionEvent
 from contracts.ledger import LedgerRecord
@@ -89,7 +91,10 @@ def test_async_disabled_creates_no_file(urls: tuple[str, str], tmp_path: Path,
     monkeypatch.delenv("ORCHESTRATOR_AUDIT_OUTBOX", raising=False)
     monkeypatch.chdir(tmp_path)
     eid, key = engagement(urls[0]), uuid4()
-    with TestClient(create_app(database_url=urls[0], redis_url=urls[1], m4_audit_token="test-m4")) as client:
+    app = create_app(database_url=urls[0], redis_url=urls[1], m4_audit_token="test-m4")
+    with TestClient(app) as client:
+        assert app.state.audit_database is app.state.services.database
+        assert app.state.audit_delivery is None
         response = client.post(f"/engagements/{eid}/audit-events", json=event().model_dump(mode="json"), headers=headers(key))
         assert response.status_code == 503
         assert client.post(f"/engagements/{eid}/audit-events", json=event().model_dump(mode="json"),
@@ -313,3 +318,83 @@ def test_lifespan_releases_wal_anchor(urls: tuple[str, str], tmp_path: Path,
         box.enqueue(uuid4(), uuid4(), event())
         assert Path(f"{path}-wal").exists()
     assert not Path(f"{path}-wal").exists()
+
+
+def test_exhausted_audit_pool_cannot_starve_state_or_killswitch(stalled: TestClient,
+                                                             urls: tuple[str, str]) -> None:
+    app = cast(FastAPI, stalled.app)
+    audit_pool: ConnectionPool = app.state.audit_database
+    primary_pool: ConnectionPool = app.state.services.database
+    delivery: AuditDelivery = app.state.audit_delivery
+    assert audit_pool is not primary_pool and delivery.database is audit_pool
+    eid, key = engagement(urls[0]), uuid4()
+    path = f"/engagements/{eid}"
+    with ThreadPoolExecutor(max_workers=2) as callers:
+        # Hold every audit connection, then prove a real audit request waits on
+        # that pool while unrelated state and emergency-stop requests complete.
+        # Release holds before joining callers, including when an assertion fails.
+        with ExitStack() as holds:
+            for _ in range(audit_pool.max_size):
+                holds.enter_context(audit_pool.connection(timeout=2))
+            waiting_audit = callers.submit(stalled.post, f"{path}/audit-events",
+                                           json=event().model_dump(mode="json"), headers=headers(key))
+            deadline = monotonic() + 2
+            while audit_pool.get_stats().get("requests_waiting", 0) == 0:
+                assert not waiting_audit.done(), "Audit route did not use its isolated pool"
+                assert monotonic() < deadline
+                sleep(0.005)
+            state = callers.submit(stalled.get, f"{path}/state").result(timeout=1)
+            assert state.status_code == 200 and state.json() == {"state": "INIT_SCOPING"}
+            stop = callers.submit(stalled.post, f"{path}/killswitch").result(timeout=1)
+            assert stop.status_code == 200 and stop.json()["next_state"] == "HALTED_KILLSWITCH"
+            assert not waiting_audit.done()
+        assert waiting_audit.result(timeout=3).status_code == 202
+    assert stalled.get(f"{path}/state").json() == {"state": "HALTED_KILLSWITCH"}
+
+
+def test_audit_saturation_rejects_excess_and_preserves_control_threads(
+    stalled: TestClient, urls: tuple[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = cast(FastAPI, stalled.app)
+    audit_pool: ConnectionPool = app.state.audit_database
+    outbox: AuditOutbox = app.state.audit_outbox
+    eid = engagement(urls[0])
+    path = f"/engagements/{eid}"
+    workers = 40
+    barrier = Barrier(workers + 1, timeout=5)
+    overflow = Event()
+    getconn = audit_pool.getconn
+
+    def observed_getconn(timeout: float | None = None) -> psycopg.Connection:
+        try:
+            return getconn(timeout=timeout)
+        except TooManyRequests:
+            overflow.set()
+            raise
+
+    def submit_audit() -> int:
+        barrier.wait()
+        return int(stalled.post(f"{path}/audit-events", json=event().model_dump(mode="json"),
+                                headers=headers(uuid4())).status_code)
+
+    with ThreadPoolExecutor(max_workers=workers + 1) as callers:
+        with ExitStack() as holds:
+            for _ in range(audit_pool.max_size):
+                holds.enter_context(audit_pool.connection(timeout=2))
+            # Observe real pool overflow rather than accepting forty eventual
+            # timeouts as proof that the queue itself is bounded.
+            monkeypatch.setattr(audit_pool, "getconn", observed_getconn)
+            attempts = [callers.submit(submit_audit) for _ in range(workers)]
+            barrier.wait()
+            assert overflow.wait(timeout=2), "Saturated audit waiting queue did not reject excess requests"
+            assert audit_pool.get_stats().get("requests_waiting", 0) <= 8
+            state = callers.submit(stalled.get, f"{path}/state").result(timeout=1)
+            assert state.status_code == 200 and state.json() == {"state": "INIT_SCOPING"}
+            stop = callers.submit(stalled.post, f"{path}/killswitch").result(timeout=1)
+            assert stop.status_code == 200 and stop.json()["next_state"] == "HALTED_KILLSWITCH"
+            # All audit connections are still held, so both queue overflow and
+            # acquisition timeouts must return accurate 503s before any 202.
+            assert [attempt.result(timeout=2) for attempt in attempts] == [503] * workers
+            assert outbox.pending() is None
+        accepted = stalled.post(f"{path}/audit-events", json=event().model_dump(mode="json"), headers=headers(uuid4()))
+        assert accepted.status_code == 202

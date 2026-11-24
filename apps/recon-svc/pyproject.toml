@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redops-recon-svc"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "redops-contracts==0.1.0",
+    "fastapi>=0.115,<1",
+    "pydantic>=2.8,<3",
+    "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+test = ["httpx>=0.27,<1", "mypy>=1.11,<3", "pytest>=8,<10"]
+
+[tool.uv.sources]
+redops-contracts = { path = "../../packages/contracts-py" }
+
+[tool.setuptools]
+py-modules = ["main"]
+packages = ["collectors"]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "../../packages/contracts-py"]
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = "$MYPY_CONFIG_FILE_DIR/../../packages/contracts-py"
+exclude = ['^(\./)?build/']

@@ -1,0 +1,14 @@
+{
+  "name": "confidence_score",
+  "version": "1.0.0",
+  "agent": "triage",
+  "input_schema": "workers:ArtifactInput",
+  "output_schema": "workers.triage:ConfidenceScoreOutput",
+  "token_budget": {
+    "input_tokens": 12000,
+    "output_tokens": 1024
+  },
+  "fixtures": [
+    "examples/golden.v1.0.0.json"
+  ]
+}

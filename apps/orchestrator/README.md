@@ -28,6 +28,14 @@ record, continuing the hash chain once. No queue transaction is held while
 waiting for a PostgreSQL engagement lock. Shutdown is bounded; unacknowledged
 jobs remain on disk for restart.
 
+Outbox mode keeps one idle SQLite WAL connection open while every writer still
+commits with FULL durability. Non-transition audit requests and delivery use a
+separate PostgreSQL pool with four connections, at most eight waiters, and a
+250 ms acquisition timeout. Overload returns 503 before acceptance; the caller
+retains its durable job for retry. State, transitions, and killswitch keep the
+original pool. This also bounds audit requests waiting in shared HTTP workers;
+it does not promise isolation from arbitrary traffic to other endpoints.
+
 Back up and restore the outbox consistently with the ledger, and retain pending
 jobs during outages. An unavailable/full outbox fails acceptance instead of
 returning a false 202. Evidence promotion still requires the actual durable

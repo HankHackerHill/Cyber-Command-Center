@@ -1,0 +1,27 @@
+{
+  "version": "1.0.0",
+  "prompt_sha256": "025bcbce2d602b479f559d32f76c42fb3b555075b4a54842b22310c779fea6c0",
+  "output": {
+    "findings": [
+      {
+        "code": "unvalidated_recipient",
+        "evidence_ref": "llm_tool_schema",
+        "confidence_score": 0.9
+      },
+      {
+        "code": "excessive_agency",
+        "evidence_ref": "llm_tool_schema",
+        "confidence_score": 0.9
+      },
+      {
+        "code": "unbounded_array",
+        "evidence_ref": "llm_tool_schema",
+        "confidence_score": 0.9
+      }
+    ]
+  },
+  "source": {
+    "path": "tests/fixtures/llm_tool_schema.json",
+    "sha256": "c7e82efd5821404ce691c4e657e1c68e35c2c06a800091f9b9fda5de1ee59672"
+  }
+}

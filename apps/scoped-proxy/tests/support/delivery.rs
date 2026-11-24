@@ -583,6 +583,31 @@ impl Fixture {
     pub async fn request(&self) -> Wire {
         read_wire(&mut BufReader::new(self.send().await)).await
     }
+    pub async fn admission_probe(&self) -> Wire {
+        let mut stream = TcpStream::connect(self.proxy).await.unwrap();
+        // Relative form fails before M3 evaluation or target egress, while the
+        // outbox admission check still exposes any recovery or 5xx barrier.
+        stream.write_all(format!("GET / HTTP/1.1\r\nHost: invalid\r\nX-Security-Assessment-ID: {ID}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        read_wire(&mut BufReader::new(stream)).await
+    }
+    pub async fn wait_admission_available(&self) {
+        timeout(LIMIT, async {
+            loop {
+                let response = self.admission_probe().await;
+                if response.line.contains("400") {
+                    break;
+                }
+                assert!(
+                    response.line.contains("503")
+                        && String::from_utf8_lossy(&response.body).contains("OUTBOX_UNAVAILABLE"),
+                    "unexpected admission probe: {response:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("outbox admission barrier did not clear");
+    }
     pub async fn wait_stopped(&self) {
         timeout(LIMIT, async {
             loop {

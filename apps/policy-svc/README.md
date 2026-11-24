@@ -6,10 +6,37 @@ the bucket, receipt count and Redis `TIME` in one atomic Lua snapshot, saving
 one Redis round trip compared with separate snapshot and clock commands.
 Bucket arithmetic stays in Python, and each CAS retry takes a new snapshot.
 The legacy `_read` and `_now_us` interfaces and injected test clocks remain
-available. A missing or modified
-registry file immediately denies, including after a cache hit. The bounded
+available. A missing or modified registry file immediately denies, including
+after a cache hit. The bounded
 128-entry manifest cache only avoids repeated JSON/Pydantic parsing; original
 manifest timestamp strings are retained for OPA's nanosecond comparison.
+
+Each admission attempt, including every CAS retry, first validates the Redis
+snapshot and clock, then starts a new M2 state GET while evaluating OPA. Both
+results must allow before the reservation CAS. State denial or failure takes
+precedence over the policy result, as before. An OPA query may therefore run
+during an eventual M2 denial;
+it accesses only the configured policy service and cannot authorize egress.
+Backwards accounting time and invalid accounting retain their earlier priority.
+There is no cached state or cached allow.
+
+After M2 joins an initial OPA allow, admission samples UTC again. It requests a
+full fresh OPA evaluation if the clock is naive, moved backwards, crossed a UTC
+date, or reached the parsed manifest end minus one microsecond. Subtracting one
+microsecond only triggers an extra evaluation; OPA still applies the original
+nanosecond timestamp strings, so this introduces no boundary over-denial.
+Otherwise the original allow proves the start was reached, forward time is
+still before the exact end, and the UTC weekday is unchanged. This proves that
+the original window truth still holds without locally granting a window. The
+fresh evaluation uses the same accounting snapshot, which the subsequent CAS
+must still match; retries repeat the entire procedure.
+
+The app bounds state-check execution to eight workers and eight submitted jobs.
+Every return or error drains its own state-check future; no operation is left
+running after that request finishes. Authority task failures deny admission,
+and lifespan shutdown drains the executor before closing its HTTP clients.
+This overlaps independent I/O; it does not make M2 state and Redis reservation
+one distributed transaction or strengthen their existing in-flight ordering.
 
 The decision cache contains **only `SCOPE_DENIED`**, keyed by the exact manifest
 hash, method, host, IP, path and timestamp. It holds at most 2,048 entries for one

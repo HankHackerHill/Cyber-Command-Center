@@ -1,0 +1,33 @@
+{
+  "version": "1.0.0",
+  "prompt_sha256": "bdacd2894ac5b75c985acd1895ffd9f88f0a6bb06175d17bf06a7d768656f5bc",
+  "output": {
+    "findings": [
+      {
+        "code": "redacted_secret_indicator",
+        "evidence_ref": "repo_exposure",
+        "confidence_score": 0.9
+      }
+    ]
+  },
+  "input": {
+    "artifacts": [
+      {
+        "ref": "repo_exposure",
+        "data": {
+          "redacted": true,
+          "indicator_class": "service_token",
+          "exposure_recorded": true
+        }
+      },
+      {
+        "ref": "decoy",
+        "data": {
+          "redacted": true,
+          "indicator_class": "placeholder",
+          "exposure_recorded": false
+        }
+      }
+    ]
+  }
+}

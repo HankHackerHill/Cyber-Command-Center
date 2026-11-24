@@ -5,7 +5,7 @@ import os
 import secrets
 import sqlite3
 from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Literal
 from uuid import UUID
@@ -19,7 +19,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from psycopg import Error as PostgresError
-from psycopg_pool import ConnectionPool, PoolTimeout
+from psycopg_pool import ConnectionPool, PoolTimeout, TooManyRequests
 from pydantic import BaseModel
 from redis import Redis
 from redis.exceptions import RedisError
@@ -105,10 +105,21 @@ def create_app(
             ) as pool,
             Redis.from_url(redis_url or os.environ["REDIS_URL"],
                            socket_connect_timeout=0.25, socket_timeout=0.25) as publisher,
+            (ConnectionPool(
+                database_url or os.environ["DATABASE_URL"],
+                open=False, min_size=1, max_size=4, max_waiting=8, timeout=0.25,
+                kwargs={"autocommit": True},
+            ) if outbox_path else nullcontext(None)) as audit_pool,
         ):
             app.state.services = Services(pool, publisher)
+            # Audit acceptance can wait on the engagement row lock and durable
+            # SQLite commit. Keep those waits out of the state/transition/stop
+            # pool, including the worker and receipt polling. Default mode opens
+            # only the original pool.
+            audit_database = audit_pool if audit_pool is not None else pool
+            app.state.audit_database = audit_database
             outbox = AuditOutbox(outbox_path) if outbox_path else None
-            delivery = AuditDelivery(outbox, pool) if outbox is not None else None
+            delivery = AuditDelivery(outbox, audit_database) if outbox is not None else None
             app.state.audit_outbox = outbox
             app.state.audit_delivery = delivery
             if delivery is not None:
@@ -180,31 +191,37 @@ def create_app(
         outbox: AuditOutbox | None = request.app.state.audit_outbox
         if asynchronous and outbox is None:
             raise HTTPException(503, "Asynchronous audit delivery is not configured")
-        with resources.database.connection() as conn:
-            try:
-                if outbox is None:
-                    receipt, created = record_audit_event(conn, id, event, key)
-                else:
-                    with conn.transaction():
-                        # Serialize reservation versus synchronous append across processes.
-                        # Transition append and signature/guard logic remain in ledger.py.
-                        lock_engagement(conn, id)
-                        if key is not None:
-                            outbox.check(id, key, event)
-                        if asynchronous:
-                            assert key is not None
-                            prior = audit_receipt(conn, id, key, event)
-                            if prior is not None:
-                                response.status_code = 200
-                                return prior
-                            outbox.enqueue(id, key, event)
-                            response.status_code = 202
-                            return QueuedAudit(engagement_id=id, event_id=key)
+        audit_database: ConnectionPool = request.app.state.audit_database
+        try:
+            with audit_database.connection() as conn:
+                try:
+                    if outbox is None:
                         receipt, created = record_audit_event(conn, id, event, key)
-            except AuditReplayConflict as exc:
-                raise HTTPException(409, "Idempotency-Key was used for a different event") from exc
-            except (sqlite3.Error, OSError) as exc:
-                raise HTTPException(503, "Durable audit delivery unavailable") from exc
+                    else:
+                        with conn.transaction():
+                            # Serialize reservation versus synchronous append across processes.
+                            # Transition append and signature/guard logic remain in ledger.py.
+                            lock_engagement(conn, id)
+                            if key is not None:
+                                outbox.check(id, key, event)
+                            if asynchronous:
+                                assert key is not None
+                                prior = audit_receipt(conn, id, key, event)
+                                if prior is not None:
+                                    response.status_code = 200
+                                    return prior
+                                outbox.enqueue(id, key, event)
+                                response.status_code = 202
+                                return QueuedAudit(engagement_id=id, event_id=key)
+                            receipt, created = record_audit_event(conn, id, event, key)
+                except AuditReplayConflict as exc:
+                    raise HTTPException(409, "Idempotency-Key was used for a different event") from exc
+                except (sqlite3.Error, OSError) as exc:
+                    raise HTTPException(503, "Durable audit delivery unavailable") from exc
+        except (PoolTimeout, TooManyRequests) as exc:
+            if outbox is None:
+                raise  # Preserve the original synchronous pool and timeout behavior.
+            raise HTTPException(503, "Audit delivery capacity unavailable") from exc
         response.status_code = 201 if created else 200
         return receipt
 
@@ -219,8 +236,9 @@ def create_app(
         local = outbox.lookup(id, event_id) if outbox is not None else None
         if isinstance(local, LedgerRecord):
             return local
+        audit_database: ConnectionPool = request.app.state.audit_database
         try:
-            with resources.database.connection(timeout=0.25) as conn:
+            with audit_database.connection(timeout=0.25) as conn:
                 with conn.transaction():
                     conn.execute("SET LOCAL statement_timeout = '1000ms'")
                     prior = audit_receipt(conn, id, event_id)
