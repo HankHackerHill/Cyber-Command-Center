@@ -115,7 +115,10 @@ class AccountStore:
         )
         if not isinstance(snapshot, list) or len(snapshot) != 2:
             raise InvalidInput("invalid accounting response")
-        raw, receipts = snapshot
+        return self._decode_bucket(snapshot[0], snapshot[1])
+
+    @staticmethod
+    def _decode_bucket(raw: object, receipts: object) -> tuple[str, Bucket]:
         if not isinstance(raw, (str, bytes)):
             raise InvalidInput("missing accounting")
         if isinstance(raw, bytes):
@@ -129,6 +132,44 @@ class AccountStore:
         if bucket.rate == 0 and (bucket.at_us or bucket.active_workers or bucket.errors_5xx):
             raise InvalidInput("invalid initial bucket")
         return raw, bucket
+
+    @staticmethod
+    def _lua_time_us(instant: object) -> int:
+        # Redis TIME inside Lua returns decimal bulk strings, unlike the
+        # redis-py TIME command callback's integer tuple. Never use Lua tonumber
+        # or cjson: bucket credit and counters remain exact Python integers.
+        if not isinstance(instant, list) or len(instant) != 2:
+            raise InvalidInput("invalid accounting clock")
+        parts: list[int] = []
+        for component in instant:
+            if isinstance(component, bytes):
+                component = component.decode("ascii")
+            if not isinstance(component, str) or re.fullmatch(r"[0-9]{1,19}", component) is None:
+                raise InvalidInput("invalid accounting clock")
+            parts.append(int(component))
+        seconds, micros = parts
+        if seconds > 2 ** 63 - 1 or not 0 <= micros < 1_000_000:
+            raise InvalidInput("invalid accounting clock")
+        return seconds * 1_000_000 + micros
+
+    def _admission_snapshot(self, key: str) -> tuple[str, Bucket, int]:
+        if self.time_us is not None:
+            # Keep the deterministic injected-clock interface used by trusted
+            # tests and callers, including one fresh clock sample per CAS retry.
+            raw, bucket = self._read(key)
+            now = self._now_us()
+            if type(now) is not int or now < 0:
+                raise InvalidInput("invalid accounting clock")
+            return raw, bucket, now
+        snapshot: object = self.redis.eval(
+            "return {redis.call('HGET', KEYS[1], 'state'), "
+            "redis.call('HLEN', KEYS[1]) - 1, redis.call('TIME')}",
+            1, key,
+        )
+        if not isinstance(snapshot, list) or len(snapshot) != 3:
+            raise InvalidInput("invalid accounting response")
+        raw, bucket = self._decode_bucket(snapshot[0], snapshot[1])
+        return raw, bucket, self._lua_time_us(snapshot[2])
 
     def _now_us(self) -> int:
         if self.time_us is not None:
@@ -154,8 +195,7 @@ class AccountStore:
     ) -> tuple[Decision, str | None]:
         key = self._key(engagement_id)
         for _ in range(12):
-            raw, bucket = self._read(key)
-            now = self._now_us()
+            raw, bucket, now = self._admission_snapshot(key)
             if now < bucket.at_us:
                 return Decision(reason="CLOCK_UNAVAILABLE"), None
             # At a rate change, refill elapsed time at the more restrictive rate.

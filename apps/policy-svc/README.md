@@ -1,7 +1,12 @@
 # Policy admission and settlement
 
 Admission still reads and SHA-256 verifies the active manifest file on every
-request, then checks fresh Redis state/time and M2 state. A missing or modified
+request, then checks fresh Redis state/time and M2 state. Admission obtains
+the bucket, receipt count and Redis `TIME` in one atomic Lua snapshot, saving
+one Redis round trip compared with separate snapshot and clock commands.
+Bucket arithmetic stays in Python, and each CAS retry takes a new snapshot.
+The legacy `_read` and `_now_us` interfaces and injected test clocks remain
+available. A missing or modified
 registry file immediately denies, including after a cache hit. The bounded
 128-entry manifest cache only avoids repeated JSON/Pydantic parsing; original
 manifest timestamp strings are retained for OPA's nanosecond comparison.

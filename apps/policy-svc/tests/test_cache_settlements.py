@@ -1,9 +1,11 @@
 """Conservative cache proof and atomic, retry-safe trusted settlement protocol."""
 
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from threading import Barrier
+from typing import cast
 from uuid import uuid4
 
 import httpx
@@ -328,3 +330,117 @@ def test_manifest_cache_skips_parsing_but_never_skips_live_hash(sandbox: Sandbox
         manifest_path.write_bytes(changed_bytes)
         assert client.post("/evaluate", json=envelope(digest)).json()["reason"] == "INVALID_MANIFEST"
         assert parses == 1
+
+
+def test_admission_snapshot_removes_separate_time_round_trip(sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    engagement, _ = sandbox.provision()
+    commands: list[tuple[object, ...]] = []
+    original = cast(Callable[..., object], sandbox.store.redis.execute_command)
+
+    def spy(*args: object, **kwargs: object) -> object:
+        commands.append(args)
+        result: object = original(*args, **kwargs)
+        return result
+
+    monkeypatch.setattr(sandbox.store.redis, "execute_command", spy)
+    result, receipt = sandbox.store.reserve(engagement, 2, lambda _: Decision(allow=True, reason="ALLOWED"))
+    assert result.allow and receipt is not None
+    assert len(commands) == 2  # One atomic read+TIME, then the reservation CAS.
+    assert all(command[0] == "EVAL" for command in commands)
+    assert "redis.call('TIME')" in str(commands[0][1])
+    assert sandbox.store.complete(engagement, receipt, 200)
+
+
+def test_atomic_snapshot_matches_legacy_credit_clock_and_counters(sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    class LegacyStore(main.AccountStore):
+        def _admission_snapshot(self, key: str) -> tuple[str, main.Bucket, int]:
+            raw, bucket = self._read(key)
+            return raw, bucket, self._now_us()
+
+    engagements = [sandbox.provision()[0] for _ in range(2)]
+    stores = [main.AccountStore(sandbox.store.redis), LegacyStore(sandbox.store.redis)]
+    instant = 1_900_000_000_000_000
+    original = sandbox.store.redis.eval
+
+    def clocked_eval(script: str, numkeys: int, *keys_and_args: str) -> object:
+        result: object = original(script, numkeys, *keys_and_args)
+        if "redis.call('TIME')" in script:
+            assert isinstance(result, list) and len(result) == 3
+            result[2] = [str(instant // 1_000_000), str(instant % 1_000_000)]
+        return result
+
+    monkeypatch.setattr(sandbox.store.redis, "eval", clocked_eval)
+    monkeypatch.setattr(sandbox.store.redis, "time", lambda: divmod(instant, 1_000_000))
+    histories: list[list[main.Runtime]] = [[], []]
+    receipts: list[list[str]] = [[], []]
+
+    def attempt() -> list[Decision]:
+        results: list[Decision] = []
+        for index, (store, engagement) in enumerate(zip(stores, engagements, strict=True)):
+            def judge(runtime: main.Runtime) -> Decision:
+                histories[index].append(runtime)
+                if runtime["errors_5xx"] >= 1:
+                    return Decision(reason="BREAKER_DENIED")
+                if runtime["tokens"] < 1:
+                    return Decision(reason="RATE_DENIED")
+                return Decision(allow=True, reason="ALLOWED")
+            result, receipt = store.reserve(engagement, 2, judge)
+            results.append(result)
+            if receipt is not None:
+                receipts[index].append(receipt)
+        assert results[0] == results[1]
+        assert histories[0] == histories[1]
+        assert stores[0]._read(stores[0]._key(engagements[0]))[1] == stores[1]._read(stores[1]._key(engagements[1]))[1]
+        return results
+
+    assert attempt()[0].allow
+    assert attempt()[0].allow
+    assert attempt()[0].reason == "RATE_DENIED"
+    instant += 499_999
+    assert attempt()[0].reason == "RATE_DENIED"
+    instant += 1
+    assert attempt()[0].allow
+    for index, (store, engagement) in enumerate(zip(stores, engagements, strict=True)):
+        assert store.complete(engagement, receipts[index][0], 503)
+    assert attempt()[0].reason == "BREAKER_DENIED"
+    instant -= 1
+    assert attempt()[0].reason == "CLOCK_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("value", [
+    None, [], ["1"], ["1", "0", "0"], [True, "0"], [1, "0"],
+    ["-1", "0"], ["+1", "0"], ["1.0", "0"], [" 1", "0"],
+    ["1", "1000000"], ["1", "-1"], ["9223372036854775808", "0"],
+    ["1" * 100, "0"], ["１", "0"], [b"\xff", b"0"],
+])
+def test_lua_clock_rejects_malformed_values(value: object) -> None:
+    with pytest.raises(ValueError):
+        main.AccountStore._lua_time_us(value)
+
+
+def test_lua_clock_exact_decimal_strings_and_bytes() -> None:
+    assert main.AccountStore._lua_time_us(["1900000000", "999999"]) == 1_900_000_000_999_999
+    assert main.AccountStore._lua_time_us([b"1900000000", b"000001"]) == 1_900_000_000_000_001
+    assert main.AccountStore._lua_time_us(["0", "0"]) == 0
+    assert main.AccountStore._lua_time_us([str(2 ** 63 - 1), "999999"]) == (2 ** 63 - 1) * 1_000_000 + 999_999
+
+
+def test_malformed_atomic_clock_denies_endpoint_without_releasing_workers(sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    engagement, digest = sandbox.provision()
+    original = sandbox.store.redis.eval
+
+    def malformed_clock(script: str, numkeys: int, *keys_and_args: str) -> object:
+        result: object = original(script, numkeys, *keys_and_args)
+        if "redis.call('TIME')" in script:
+            assert isinstance(result, list)
+            result[2] = ["1", "1000000"]
+        return result
+
+    # Patch the service's accounting Redis client after its lifespan creates it.
+    with sandbox.service() as client:
+        store: main.AccountStore = getattr(client.app, "state").accounting
+        monkeypatch.setattr(store.redis, "eval", malformed_clock)
+        response = client.post("/evaluate", json=envelope(digest))
+        assert response.status_code == 200
+        assert response.json() == {"allow": False, "reason": "ACCOUNTING_UNAVAILABLE"}
+        assert sandbox.store._read(sandbox.store._key(engagement))[1].active_workers == 0
