@@ -6,12 +6,14 @@ const localServices = {
   orchestrator: 'REDOPS_ORCHESTRATOR_URL',
   graph: 'REDOPS_GRAPH_URL',
   evidence: 'REDOPS_EVIDENCE_URL',
+  report: 'REDOPS_REPORT_URL',
 } as const
 
 const exposedRoutes = {
-  orchestrator: /^(?:GET \/engagements\/[0-9a-f-]{36}\/(?:state|ledger)|POST \/engagements\/[0-9a-f-]{36}\/(?:transition|killswitch))$/,
+  orchestrator: /^(?:GET \/engagements\/[0-9a-f-]{36}\/(?:state|ledger|findings)|POST \/engagements\/[0-9a-f-]{36}\/(?:transition|killswitch))$/,
   graph: /^POST \/(?:paths|tier0-reach)$/,
   evidence: /^GET \/(?:findings\/[^/?#]+\/evidence|artifacts\/[0-9a-f]{64})$/,
+  report: /^POST \/render$/,
 }
 
 export default defineConfig(({ mode }) => {

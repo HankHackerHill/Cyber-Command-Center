@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Assessment report</title>
+<meta name="author" content="RedOps Command Center">
+<style>
+  @page {
+    size: A4;
+    margin: 18mm 17mm 20mm;
+    @bottom-left { content: "RedOps Command Center"; color: #415462; font: 8pt "DejaVu Sans", sans-serif; }
+    @bottom-right { content: counter(page) " / " counter(pages); color: #415462; font: 8pt "DejaVu Sans", sans-serif; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; color: #192d39; font: 10pt/1.45 "DejaVu Sans", sans-serif; }
+  section { margin: 0 0 8mm; }
+  h1 { font: bold 19pt/1.2 "DejaVu Sans", sans-serif; margin: 6mm 0 3mm; color: #163a4c; break-after: avoid; }
+  .cover { break-after: page; padding-top: 38mm; }
+  .cover h1 { font-size: 32pt; margin-bottom: 12mm; }
+  .appendix { break-before: page; }
+  h2 { font-size: 11pt; margin: 4mm 0 1mm; break-after: avoid; overflow-wrap: anywhere; }
+  p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 1mm 0 2mm; }
+  .code, .evidence { font: 8pt/1.45 "DejaVu Sans Mono", monospace; }
+  table { border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 8pt; }
+  thead { display: table-header-group; }
+  th, td { text-align: left; vertical-align: top; padding: 2mm; border-bottom: 0.3mm solid #acb9c1; white-space: pre-wrap; overflow-wrap: anywhere; }
+  th { background: #e7eff1; color: #173846; }
+</style>
+</head>
+<body>
+{% for chapter in chapters %}
+<section class="{{ chapter.section.value }}">
+  <h1>{{ chapter.title }}</h1>
+  {% for block in chapter.blocks %}
+    {% if block.headers is defined %}
+    <table><thead><tr>{% for label in block.headers %}<th scope="col">{{ label }}</th>{% endfor %}</tr></thead>
+    <tbody>{% for row in block.rows %}<tr>{% for cell in row %}<td>{{ cell|printable }}</td>{% endfor %}</tr>{% endfor %}</tbody></table>
+    {% elif block.style == "subheading" %}<h2>{{ block.text|printable }}</h2>
+    {% elif block.style == "evidence" %}<p class="evidence"><a href="{{ block.text }}">{{ block.text }}</a></p>
+    {% else %}<p class="{{ block.style }}">{{ block.text|printable }}</p>
+    {% endif %}
+  {% endfor %}
+</section>
+{% endfor %}
+</body>
+</html>

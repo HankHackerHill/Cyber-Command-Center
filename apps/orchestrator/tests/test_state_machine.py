@@ -47,16 +47,35 @@ def archive_request(
 def transition_request(
     engagement: UUID, source: EngagementState, destination: EngagementState,
     key: Ed25519PrivateKey | None = None, actor_type: ActorType = ActorType.HUMAN_OPERATOR,
+    *, plan_id: UUID | None = None, plan_hash: str | None = None,
 ) -> TransitionEvent:
     event = TransitionEvent(
         event_id=str(uuid4()), engagement_id=str(engagement), from_state=source, to_state=destination,
         actor_type=actor_type, actor_id="scope-reviewer", occurred_at=datetime.now(timezone.utc),
+        approved_plan_id=plan_id, approved_plan_hash=plan_hash,
     )
     if key is None:
         return event
     return event.model_copy(update={"hitl_signature": Ed25519Signature(
         signer_id=event.actor_id, signature=key.sign(event.canonical_envelope()).hex(),
     )})
+
+
+def seed_plan(db: psycopg.Connection, engagement: UUID) -> tuple[UUID, str]:
+    """Independently compute the digest of the exact five columns the signer reviews."""
+    plan_id = uuid4()
+    approver = {"signer_id": "réviseur", "signature": Ed25519PrivateKey.generate().sign(plan_id.bytes).hex()}
+    db.execute(
+        """INSERT INTO validation_plans (engagement_id, id, blast_radius, approver_sig)
+           VALUES (%s, %s, 'READ_ONLY', %s::jsonb)""",
+        (engagement, str(plan_id), json.dumps(approver)),
+    )
+    plan = {
+        "engagement_id": str(engagement), "id": str(plan_id), "blast_radius": "READ_ONLY",
+        "approver_sig": approver, "second_approver_sig": None,
+    }
+    canonical = json.dumps(plan, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return plan_id, hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def assert_journal(
@@ -226,17 +245,21 @@ def test_all_running_nonstop_handoffs(
     database, redis = urls
     engagement = uuid4()
     key = Ed25519PrivateKey.generate()
-    event = transition_request(
-        engagement, source, destination,
-        key if destination in {
-            EngagementState.ROE_LOCKED, EngagementState.CONTROLLED_VALIDATION,
-            EngagementState.COMPLETED_ARCHIVED,
-        } else None,
-    )
     previous = GENESIS_HASH
     events: list[TransitionEvent] = []
     with psycopg.connect(database) as connection:
         connection.execute("INSERT INTO engagements (id, current_state) VALUES (%s, %s)", (engagement, source))
+        plan_id, plan_hash = (
+            seed_plan(connection, engagement) if destination == EngagementState.CONTROLLED_VALIDATION
+            else (None, None)
+        )
+        event = transition_request(
+            engagement, source, destination,
+            key if destination in {
+                EngagementState.ROE_LOCKED, EngagementState.CONTROLLED_VALIDATION,
+                EngagementState.COMPLETED_ARCHIVED,
+            } else None, plan_id=plan_id, plan_hash=plan_hash,
+        )
         if source == EngagementState.EVIDENCE_VERIFICATION:
             history = event.model_copy(update={
                 "event_id": str(uuid4()), "from_state": EngagementState.CONTROLLED_VALIDATION, "to_state": source,
@@ -343,6 +366,78 @@ def test_human_gate_is_denied_without_writes(
             assert_journal(client, database, engagement, source, [])
 
 
+def test_plan_gate_rejections_preserve_state_and_ledger(urls: tuple[str, str]) -> None:
+    database, redis = urls
+    engagement, other = uuid4(), uuid4()
+    source = EngagementState.AWAITING_HITL_GATE
+    destination = EngagementState.CONTROLLED_VALIDATION
+    with psycopg.connect(database) as db:
+        db.execute("INSERT INTO engagements (id, current_state) VALUES (%s, %s), (%s, %s)",
+                   (engagement, source, other, source))
+        plan_id, plan_hash = seed_plan(db, engagement)
+        foreign_id, foreign_hash = seed_plan(db, other)
+
+    key = Ed25519PrivateKey.generate()
+
+    def approval(plan: UUID | None, digest: str | None) -> TransitionEvent:
+        return transition_request(engagement, source, destination, key, plan_id=plan, plan_hash=digest)
+
+    signed = approval(plan_id, plan_hash)
+    app = create_app(database_url=database, redis_url=redis,
+                     trusted_public_keys={signed.actor_id: key.public_key()})
+    with TestClient(app) as client:
+        def reject(event: TransitionEvent, status: int, reason: str) -> None:
+            result = client.post(f"/engagements/{engagement}/transition", json=event.model_dump(mode="json"))
+            assert result.status_code == status, result.text
+            assert result.json() == {"reason": reason}
+            assert_journal(client, database, engagement, source, [])
+
+        for incomplete in (approval(None, None), approval(None, plan_hash), approval(plan_id, None)):
+            reject(incomplete, 422, "PLAN_BINDING_REQUIRED")
+        reject(approval(uuid4(), plan_hash), 404, "PLAN_NOT_FOUND")
+        reject(approval(foreign_id, foreign_hash), 404, "PLAN_NOT_FOUND")
+        reject(approval(plan_id, "0" * 64), 409, "PLAN_HASH_MISMATCH")
+        reject(signed.model_copy(update={"approved_plan_hash": "1" * 64}), 403, "HUMAN_SIGNATURE_REQUIRED")
+        reject(signed.model_copy(update={"approved_plan_id": foreign_id}), 403, "HUMAN_SIGNATURE_REQUIRED")
+
+        legacy_payload = signed.model_dump(mode="json")
+        legacy_payload["approved_plan_id"] = "a" * 64
+        legacy = client.post(f"/engagements/{engagement}/transition", json=legacy_payload)
+        assert legacy.status_code == 422 and legacy.json() == {"reason": "INVALID_EVENT"}
+        assert_journal(client, database, engagement, source, [])
+
+        # A reviewer may have fetched and signed a snapshot before another writer amended the row.
+        with psycopg.connect(database) as db:
+            db.execute(
+                """UPDATE validation_plans SET approver_sig =
+                       jsonb_set(approver_sig, '{signer_id}', to_jsonb('changed-reviewer'::text))
+                   WHERE engagement_id = %s AND id = %s""", (engagement, str(plan_id)),
+            )
+        reject(signed, 409, "PLAN_HASH_MISMATCH")
+
+
+def test_plan_row_protected_until_ledger_commit(urls: tuple[str, str]) -> None:
+    database, _ = urls
+    engagement = uuid4()
+    source = EngagementState.AWAITING_HITL_GATE
+    with psycopg.connect(database) as db:
+        db.execute("INSERT INTO engagements (id, current_state) VALUES (%s, %s)", (engagement, source))
+        plan_id, plan_hash = seed_plan(db, engagement)
+    key = Ed25519PrivateKey.generate()
+    event = transition_request(engagement, source, EngagementState.CONTROLLED_VALIDATION, key,
+                               plan_id=plan_id, plan_hash=plan_hash)
+    update = "UPDATE validation_plans SET blast_radius = 'REVERSIBLE' WHERE engagement_id = %s AND id = %s"
+    with psycopg.connect(database) as writer, psycopg.connect(database, autocommit=True) as editor:
+        editor.execute("SET lock_timeout = '100ms'")
+        with writer.transaction():
+            record_review_transition(writer, engagement, event, {event.actor_id: key.public_key()})
+            with pytest.raises(psycopg.errors.LockNotAvailable):
+                editor.execute(update, (engagement, str(plan_id)))
+        assert editor.execute(update, (engagement, str(plan_id))).rowcount == 1
+        receipt, = read_ledger(editor, engagement, 0)
+        assert receipt.event == event
+
+
 @pytest.mark.parametrize(
     "states",
     [
@@ -359,6 +454,8 @@ def test_human_gate_is_denied_without_writes(
             EngagementState.AWAITING_HITL_GATE, EngagementState.ANALYTICAL_TRIAGE,
             EngagementState.AWAITING_HITL_GATE, EngagementState.CONTROLLED_VALIDATION,
             EngagementState.EVIDENCE_VERIFICATION, EngagementState.ANALYTICAL_TRIAGE,
+            EngagementState.AWAITING_HITL_GATE, EngagementState.CONTROLLED_VALIDATION,
+            EngagementState.EVIDENCE_VERIFICATION, EngagementState.ANALYTICAL_TRIAGE,
             EngagementState.REMEDIATION_SYNTHESIS, EngagementState.RETEST_VERIFICATION,
             EngagementState.REMEDIATION_SYNTHESIS, EngagementState.RETEST_VERIFICATION,
             EngagementState.COMPLETED_ARCHIVED,
@@ -370,17 +467,36 @@ def test_full_signed_assessment_progression(urls: tuple[str, str], states: list[
     engagement = uuid4()
     with psycopg.connect(database) as db:
         db.execute("INSERT INTO engagements (id) VALUES (%s)", (engagement,))
+        plan_id, expected_plan_hash = seed_plan(db, engagement)
     key = Ed25519PrivateKey.generate()
     app = create_app(database_url=database, redis_url=redis,
                      trusted_public_keys={"scope-reviewer": key.public_key()})
     events: list[TransitionEvent] = []
+    previous_approval: TransitionEvent | None = None
     with TestClient(app) as client:
+        listed = client.get(f"/engagements/{engagement}/plans")
+        assert listed.status_code == 200, listed.text
+        plan, = listed.json()
+        assert plan["id"] == str(plan_id) and plan["engagement_id"] == str(engagement)
+        reviewed = json.dumps(plan, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        plan_hash = hashlib.sha256(reviewed.encode("utf-8")).hexdigest()
+        assert plan_hash == expected_plan_hash
         assert_journal(client, database, engagement, states[0], [])
         for source, destination in zip(states[:-1], states[1:], strict=True):
             # Every hop is signed; in particular, all three human-only targets.
-            event = transition_request(engagement, source, destination, key)
-            response = client.post(f"/engagements/{engagement}/transition", json=event.model_dump(mode="json"))
+            needs_plan = destination == EngagementState.CONTROLLED_VALIDATION
+            path = f"/engagements/{engagement}/transition"
+            if needs_plan and previous_approval is not None:
+                replay = client.post(path, json=previous_approval.model_dump(mode="json"))
+                assert replay.status_code == 409 and replay.json() == {"reason": "EVENT_REPLAY"}
+                assert_journal(client, database, engagement, source, events, key)
+            event = transition_request(engagement, source, destination, key,
+                                       plan_id=plan_id if needs_plan else None,
+                                       plan_hash=plan_hash if needs_plan else None)
+            response = client.post(path, json=event.model_dump(mode="json"))
             assert response.status_code == 200, response.text
+            if needs_plan:
+                previous_approval = event
             events.append(event)
             records = assert_journal(client, database, engagement, destination, events, key)
             assert response.json() == {

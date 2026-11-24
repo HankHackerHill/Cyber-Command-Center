@@ -89,6 +89,8 @@ export interface TransitionEvent {
   actor_id: string;
   occurred_at: string;
   hitl_signature?: Ed25519Signature | null;
+  approved_plan_id?: string | null;
+  approved_plan_hash?: string | null;
 }
 export interface Ed25519Signature {
   signer_id: string;

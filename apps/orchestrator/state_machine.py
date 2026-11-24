@@ -13,6 +13,7 @@ from signatures import verify_human_signature
 
 class Reason(StrEnum):
     INVALID_EVENT = "INVALID_EVENT"
+    INVALID_MANIFEST = "INVALID_MANIFEST"
     ENGAGEMENT_NOT_FOUND = "ENGAGEMENT_NOT_FOUND"
     ENGAGEMENT_ID_MISMATCH = "ENGAGEMENT_ID_MISMATCH"
     ILLEGAL_TRANSITION = "ILLEGAL_TRANSITION"
@@ -20,6 +21,9 @@ class Reason(StrEnum):
     INVALID_SIGNATURE = "INVALID_SIGNATURE"
     STATE_MISMATCH = "STATE_MISMATCH"
     EVENT_REPLAY = "EVENT_REPLAY"
+    PLAN_BINDING_REQUIRED = "PLAN_BINDING_REQUIRED"
+    PLAN_NOT_FOUND = "PLAN_NOT_FOUND"
+    PLAN_HASH_MISMATCH = "PLAN_HASH_MISMATCH"
     TRANSITION_UNAVAILABLE = "TRANSITION_UNAVAILABLE"
 
 
@@ -59,12 +63,17 @@ ALLOWED_TRANSITIONS = frozenset({
 )
 
 
-def require_engagement_id(engagement_id: UUID, event: TransitionEvent) -> None:
-    text = event.engagement_id
+def parse_engagement_id(text: str) -> UUID:
     if text.startswith("{") and text.endswith("}"):
         text = text[1:-1]
     # PostgreSQL permits a hyphen after each group of four hex digits.
-    if not fullmatch(r"(?:[0-9a-fA-F]{4}-?){7}[0-9a-fA-F]{4}", text) or UUID(text) != engagement_id:
+    if not fullmatch(r"(?:[0-9a-fA-F]{4}-?){7}[0-9a-fA-F]{4}", text):
+        raise TransitionDenied(Reason.ENGAGEMENT_ID_MISMATCH, 422)
+    return UUID(text)
+
+
+def require_engagement_id(engagement_id: UUID, event: TransitionEvent) -> None:
+    if parse_engagement_id(event.engagement_id) != engagement_id:
         raise TransitionDenied(Reason.ENGAGEMENT_ID_MISMATCH, 422)
 
 

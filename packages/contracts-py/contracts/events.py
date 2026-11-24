@@ -4,9 +4,13 @@ import json
 import math
 from decimal import Decimal
 from enum import StrEnum
+from typing import Annotated
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, field_validator
+
+
+Sha256Hex = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
 class EngagementState(StrEnum):
@@ -116,6 +120,9 @@ class TransitionEvent(BaseModel):
     actor_id: str = Field(min_length=1)
     occurred_at: AwareDatetime
     hitl_signature: Ed25519Signature | None = None
+    # Absent ADR-0019 fields must not alter historical signatures or ledger digests.
+    approved_plan_id: UUID | None = Field(default=None, exclude_if=lambda value: value is None)
+    approved_plan_hash: Sha256Hex | None = Field(default=None, exclude_if=lambda value: value is None)
 
     def canonical_envelope(self) -> bytes:
         payload = self.model_dump(mode="json", exclude={"hitl_signature"})
