@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redops-policy-svc"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "redops-contracts==0.1.0",
+    "fastapi>=0.115,<1",
+    "httpx>=0.27,<1",
+    "redis>=5,<7",
+    "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "hypothesis>=6", "mypy>=1.11"]
+
+# Run this service in its own virtual environment.
+# From the repository root, serve the policies with OPA v1:
+# opa run --server --addr=127.0.0.1:8181 --ignore '*_test.rego' packages/policy-bundles
+# In apps/policy-svc, install ../../packages/contracts-py and '.[test]', then
+# run uvicorn main:app with POLICY_MANIFEST_DIR, ORCHESTRATOR_URL, OPA_URL, REDIS_URL.
+# POLICY_MANIFEST_DIR is a trusted read-only registry of active approved manifests:
+# name each file <lowercase SHA-256 of its exact bytes>.json. The registry owner
+# verifies signatures before provisioning and removes superseded or revoked manifests.
+# Use durable Redis for accounting. Provision a new engagement once with
+# AccountStore(redis).initialize(engagement_id). A trusted response observer calls
+# AccountStore(redis).complete(engagement_id, reservation_id, final_http_status)
+# with the X-Policy-Reservation header from /evaluate. A 5xx counts once toward
+# the engagement threshold. Outstanding receipts retain their worker slots.
+[tool.uv.sources]
+redops-contracts = { path = "../../packages/contracts-py" }
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+exclude = ['^(\./)?build/']
+plugins = ["pydantic.mypy"]
+mypy_path = "$MYPY_CONFIG_FILE_DIR/../../packages/contracts-py"
