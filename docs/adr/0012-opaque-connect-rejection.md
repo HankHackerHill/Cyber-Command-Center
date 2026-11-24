@@ -1,7 +1,6 @@
 # ADR-0012 — Require per-request visibility for CONNECT
 
-**Status.** Owner decision for M4. The M3 completion service contract below is
-a proposal. M2 and M3 remain frozen for this milestone.
+**Status: Accepted.** ADR-0013 extends the ledger contract for rejection events.
 
 ## Decision
 
@@ -42,47 +41,39 @@ the same reason for pre-200 rejections. If no bytes arrive before the
 deadline, close and record `TUNNEL_IDLE_TIMEOUT` with an empty prefix. Do
 not send a second HTTP status line on an established tunnel.
 
-The branch exposes ledger reads and state-transition writes. It has no M4
-append operation for a rejected tunnel. A successful evidence PUT alone
-cannot verify both records. The frozen `LedgerRecord` also requires a
-`TransitionEvent` payload. A tunnel rejection does not change engagement
-state. The proposed ledger extension is a distinct rejection event with an
-engagement ID, reason, captured prefix, and evidence digest, appended idempotently by the
-ledger owner. The running M4 listener denies CONNECT before 200 while
-inspection and durable rejection recording are unavailable.
+ADR-0013 specifies the durable audit route. A rejection event binds the
+engagement and diagnostic ID to its reason, prefix, and evidence digest.
+An acknowledgement from the evidence service alone does not confirm a
+ledger append.
 
 See [RFC 9110 §9.3.6](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6).
 
-## Proposed M3 completion service contract
+## Redis completion accounting
 
-M3 currently issues a reservation on `POST /evaluate`. Its trusted Python
-observer calls `AccountStore.complete`. Rust M4 needs a service interface.
-This proposal reserves the following interface for the M3 owner.
+M3 returns a UUID in `X-Policy-Reservation` on an allowed evaluation.
+Its trusted observer consumes the receipt directly in the Redis hash
+`redops:policy:v1:<canonical-engagement-id>`. This is the mechanism
+implemented by `AccountStore.complete` in `apps/policy-svc/main.py`.
+M3 defines no completion Pub/Sub channel, subscriber, or message envelope.
+The separate `redops:killswitch` channel carries stop notifications.
 
-| Field | Proposed contract |
-| --- | --- |
-| Operation | `POST /engagements/{id}/completions` on the configured policy service origin |
-| Caller | Authenticated M4 service identity |
-| Correlation | Exactly one `X-Policy-Reservation` request header containing the UUID issued by M3 |
-| JSON request | Exactly one of `{"status_code":503}` for a final origin status in the range 200–599 or `{"outcome":"no_origin_response"}` when no final status was observed |
-| JSON success | HTTP 200 with `{"breaker_tripped":false}` or `{"breaker_tripped":true}` |
-| Errors | 404 for an unknown or wrong-engagement receipt, 409 for conflicting replay, 422 for invalid input, 503 for unavailable accounting |
+The observer accepts only a final origin status from 200 through 599. In one
+compare-and-swap, it verifies the outstanding receipt, deletes it, decrements
+`active_workers`, and increments cumulative `errors_5xx` for a 5xx response.
+The rate debit remains in force. Elapsed time replenishes rate credit. A
+missing receipt or ambiguous write acknowledgement does not prove a fresh
+completion. A missing final origin status leaves the receipt outstanding
+for reconciliation. A CONNECT handshake cannot settle it.
 
-M3 must bind the receipt to its engagement and admitting manifest. A first
-completion releases one worker and records the outcome atomically. For a
-connection failure without a final origin response, release the worker and
-preserve the count of consecutive observed 5xx responses. In both cases
-the original rate debit stands. Replaying the same receipt and outcome
-returns the recorded result. A stop prevents new reservations while
-permitting settlement of outstanding work. M4 uses the result to request
-the durable halt through M2, which publishes the Redis notification after
-commit.
+M4 also tracks consecutive confirmed final statuses per engagement in its
+own process. An intervening non-5xx resets this streak. Reaching the
+threshold latches denial and invokes the orchestrator's durable killswitch.
+The M3 counter is cumulative across observers. Multiple proxy replicas
+would require shared ordering for an engagement-wide consecutive streak.
 
-The requested breaker counts consecutive origin 5xx responses in engagement-wide
-completion order and resets the streak on another final status. M3 currently
-enforces a cumulative counter. For example, at threshold two the current
-policy denies after 503, 429, 500. The requested streak at that point is one.
-The existing cumulative cap continues to apply to admission. The proposed
-consecutive count controls publication of the killswitch. Process-local M4
-streaks cannot supply cross-replica ordering. M3 implementation and a real
-reservation-release test are prerequisites for enabling target egress.
+## Checkpoint behavior
+
+The checkpoint returned `503 POLICY_COMPLETION_UNAVAILABLE` from the
+listener after the state check and before calling M3. That branch never
+acquired a reservation. An eligible request on a listener without an origin
+transport receives `501 FORWARDING_UNAVAILABLE` before admission.

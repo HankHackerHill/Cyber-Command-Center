@@ -1,13 +1,14 @@
 //! End-to-end HTTP acceptance benchmark using a provisioned loopback proxy.
 //! Set M4_LOAD_PROXY_ADDR to its literal loopback IP:port and M4_LOAD_ENGAGEMENT_ID
 //! to a locked local test engagement. Allow GET /m4-load on 127.0.0.1 and provide
-//! enough rate budget for 1,064 proxied requests. Set M4_LOAD_ORIGIN_PORT when
+//! enough rate budget for 3,064 proxied requests. Set M4_LOAD_ORIGIN_PORT when
 //! the policy needs a fixed port (default: an ephemeral port).
 //! Run `cargo test --release --test load -- --ignored --nocapture`.
 //!
 //! Four closed-loop workers alternate the order of direct/proxied transactions.
 //! Each measurement includes consumption of the entire body. After 64 warm-up
-//! pairs, compute the nearest-rank p99 of 1,000 signed, paired latency deltas.
+//! pairs, compute the nearest-rank p99 of 1,000 signed, paired latency deltas in
+//! each of three runs. The median of the three p99 values must be below 15 ms.
 
 use std::{
     collections::hash_map::RandomState,
@@ -78,9 +79,11 @@ impl Benchmark {
                     socket.set_nodelay(true)?;
                     let service = service_fn(|req: Request<Incoming>| {
                         let mut response = Response::new(Full::new(Bytes::new()));
-                        if req.uri().path() == "/m4-load"
-                            && req.headers().get(ATTRIBUTION).map(|v| v.as_bytes())
-                                == Some(id.as_bytes())
+                        let mut attribution = req.headers().get_all(ATTRIBUTION).iter();
+                        if req.method() == hyper::Method::GET
+                            && req.uri().path() == "/m4-load"
+                            && attribution.next().map(|v| v.as_bytes()) == Some(id.as_bytes())
+                            && attribution.next().is_none()
                         {
                             let tag = key.hash_one(req.uri().query()).to_be_bytes();
                             *response.body_mut() = Full::new(Bytes::copy_from_slice(&tag));
@@ -172,19 +175,58 @@ impl Benchmark {
     }
 }
 
+fn nearest_rank_p99(deltas: &mut [i128]) -> i128 {
+    assert!(!deltas.is_empty(), "p99 requires at least one sample");
+    deltas.sort_unstable();
+    deltas[(99 * deltas.len()).div_ceil(100) - 1]
+}
+
+fn median_of_three(mut p99_values: [i128; 3]) -> i128 {
+    p99_values.sort_unstable();
+    p99_values[1]
+}
+
+#[test]
+fn p99_uses_nearest_rank_for_unsorted_signed_deltas() {
+    let mut deltas: Vec<_> = (-100..=0).rev().collect();
+    assert_eq!(nearest_rank_p99(&mut deltas), -1);
+    let mut deltas: Vec<_> = (1..=1_000).rev().collect();
+    assert_eq!(nearest_rank_p99(&mut deltas), 990);
+}
+
+#[test]
+fn median_uses_the_middle_run_p99_value() {
+    assert_eq!(median_of_three([30_000_000, -500, 9_000_000]), 9_000_000);
+    assert_eq!(median_of_three([20_000_000, 15_000_000, 1]), 15_000_000);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a provisioned, running M4 proxy on loopback"]
 async fn proxied_http_overhead_p99_under_15ms() -> Result<(), Failure> {
     let benchmark = Benchmark::set_up().await?;
-    benchmark.pairs(0, WARMUP).await?;
-    let mut deltas = benchmark.pairs(WARMUP, SAMPLES).await?;
-    deltas.sort_unstable();
-    let rank = (99 * deltas.len()).div_ceil(100);
-    let p99_ns = deltas[rank - 1];
-    let p99_ms = p99_ns as f64 / 1_000_000.0;
-    println!(
-        "p99 paired HTTP overhead {p99_ms:.6} ms ({SAMPLES} pairs, concurrency {CONCURRENCY})"
+    benchmark
+        .pairs(0, WARMUP)
+        .await
+        .map_err(|err| format!("warm-up failed before any measured run: {err}"))?;
+    println!("Warm-up completed ({WARMUP} pairs, concurrency {CONCURRENCY}).");
+    let mut p99_values = [0; 3];
+    for (index, value) in p99_values.iter_mut().enumerate() {
+        let run = index + 1;
+        let start = WARMUP + index * SAMPLES;
+        let mut deltas = benchmark
+            .pairs(start, SAMPLES)
+            .await
+            .map_err(|err| format!("measured run {run} incomplete: {err}"))?;
+        *value = nearest_rank_p99(&mut deltas);
+        let p99_ms = *value as f64 / 1_000_000.0;
+        println!("Measured run {run} p99 {p99_ms:.6} ms ({SAMPLES} pairs).");
+    }
+    let median_ns = median_of_three(p99_values);
+    let median_ms = median_ns as f64 / 1_000_000.0;
+    println!("Median of three measured p99 values {median_ms:.6} ms.");
+    assert!(
+        median_ns < 15_000_000,
+        "median p99 reached {median_ms:.6} ms"
     );
-    assert!(p99_ns < 15_000_000, "p99 overhead reached {p99_ms:.6} ms");
     Ok(())
 }

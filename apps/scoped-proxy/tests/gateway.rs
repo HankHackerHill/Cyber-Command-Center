@@ -1,3 +1,5 @@
+#[path = "support/audit.rs"]
+mod mock_audit;
 #[path = "support/redis.rs"]
 mod mock_redis;
 
@@ -14,6 +16,7 @@ use tokio::{
 use uuid::Uuid;
 
 const ID: &str = "fb66cc64-81d2-4a0e-94db-324575c967c1";
+const TEST_TOKEN: &str = "test-only-gateway-audit-token";
 const SETUP: Duration = Duration::from_secs(4);
 
 struct Gateway {
@@ -42,6 +45,7 @@ impl Gateway {
                 format!("http://{}", policy.local_addr().unwrap()),
             )
             .env("REDIS_URL", format!("redis://{}", redis.address()))
+            .env("M4_AUDIT_TOKEN", TEST_TOKEN)
             .env("TOKIO_WORKER_THREADS", "2")
             .stdout(Stdio::piped())
             .kill_on_drop(true)
@@ -151,8 +155,8 @@ async fn enforces_state_at_the_listener_before_any_reservation_or_target_connect
             (
                 "CONTROLLED_VALIDATION",
                 false,
-                503,
-                "POLICY_COMPLETION_UNAVAILABLE",
+                501,
+                "FORWARDING_UNAVAILABLE",
             ),
             (
                 "CONTROLLED_VALIDATION",
@@ -169,6 +173,19 @@ async fn enforces_state_at_the_listener_before_any_reservation_or_target_connect
                 body.len()
             );
             upstream.write_all(response.as_bytes()).await.unwrap();
+            if code == 403 {
+                let body = mock_audit::acknowledge_audit(
+                    &gateway.orchestrator,
+                    Uuid::parse_str(ID).unwrap(),
+                    TEST_TOKEN,
+                )
+                .await;
+                assert_eq!(body["event_type"], "TUNNEL_REJECTED");
+                assert_eq!(
+                    body["payload"],
+                    json!({"reason":reason,"phase":"before_200","prefix_hex":""})
+                );
+            }
             assert_eq!(read_reply(caller).await, (code, json!({"reason":reason})));
         }
         gateway.assert_no_egress().await;
@@ -202,4 +219,40 @@ async fn redis_stop_preempts_an_in_flight_state_check() {
     })
     .await
     .expect("gateway stop test timed out");
+}
+
+#[tokio::test]
+async fn redis_stop_preempts_a_slow_audit_append() {
+    timeout(SETUP, async {
+        let mut gateway = Gateway::start().await;
+        let caller = gateway.request(true, &[ID]).await;
+        let mut state = gateway.state_call().await;
+        let body = br#"{"state":"CONTROLLED_VALIDATION"}"#;
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        state.write_all(head.as_bytes()).await.unwrap();
+        state.write_all(body).await.unwrap();
+        let (mut pending, _) = gateway.orchestrator.accept().await.unwrap();
+        let mut first = String::new();
+        BufReader::new(&mut pending)
+            .read_line(&mut first)
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            format!("POST /engagements/{ID}/audit-events HTTP/1.1\r\n")
+        );
+        let reply = timeout(Duration::from_millis(100), async {
+            gateway.redis.send_halt(Uuid::parse_str(ID).unwrap()).await;
+            read_reply(caller).await
+        })
+        .await
+        .expect("stop waited for the audit acknowledgement");
+        assert_eq!(reply, (412, json!({"reason":"PRECONDITION_FAILED"})));
+        gateway.assert_no_egress().await;
+    })
+    .await
+    .expect("audit preemption test timed out");
 }

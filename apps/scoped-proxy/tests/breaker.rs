@@ -8,13 +8,13 @@ pub mod policy_client;
 use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
-use breaker::Breaker;
+use breaker::{AccountingError, Breaker, complete_reservation};
 use mock_redis::{MockRedis, Subscription};
-use policy_client::{CompletionError, CompletionOutcome, PolicyClient};
+use policy_client::PolicyClient;
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -245,113 +245,179 @@ async fn unpublished_m2_stop_is_retried_after_the_caller_is_cancelled() {
 }
 
 // This mock implements the proposed M3 completion response only.
-async fn acknowledge_settlement(
-    m3: &TcpListener,
-    id: Uuid,
-    receipt: Uuid,
-    reply: &'static str,
-    abort_before_reply: Option<&AbortHandle>,
-) {
-    use bytes::Bytes;
-    use http_body_util::{BodyExt, Full};
-    use hyper::{
-        Method, Request, Response, body::Incoming, server::conn::http1, service::service_fn,
-    };
-    use hyper_util::rt::TokioIo;
-    use std::convert::Infallible;
-
-    timeout(SETUP_TIMEOUT, async {
-        let (socket, _) = m3.accept().await.unwrap();
-        let service = service_fn(|request: Request<Incoming>| async move {
-            assert_eq!(request.method(), Method::POST);
-            assert_eq!(
-                request.uri().path(),
-                format!("/engagements/{id}/completions")
-            );
-            assert_eq!(
-                request.headers()["x-policy-reservation"],
-                receipt.to_string()
-            );
-            let bytes = request.into_body().collect().await.unwrap().to_bytes();
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
-                json!({"status_code":503})
-            );
-            if let Some(caller) = abort_before_reply {
-                caller.abort();
-                while !caller.is_finished() {
-                    tokio::task::yield_now().await;
-                }
-            }
-            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
-                reply.as_bytes(),
-            ))))
-        });
-        http1::Builder::new()
-            .keep_alive(false)
-            .serve_connection(TokioIo::new(socket), service)
-            .await
+async fn redis_eval(conn: &mut BufReader<TcpStream>) -> Vec<String> {
+    loop {
+        let mut line = String::new();
+        conn.read_line(&mut line).await.unwrap();
+        let count = line
+            .trim_end()
+            .strip_prefix('*')
+            .unwrap()
+            .parse::<usize>()
             .unwrap();
-    })
-    .await
-    .expect("M3 did not receive completion");
+        let mut args = Vec::with_capacity(count);
+        for _ in 0..count {
+            line.clear();
+            conn.read_line(&mut line).await.unwrap();
+            let len = line
+                .trim_end()
+                .strip_prefix('$')
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let mut bytes = vec![0; len + 2];
+            conn.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes[len..], b"\r\n");
+            bytes.truncate(len);
+            args.push(String::from_utf8(bytes).unwrap());
+        }
+        if args[0] == "CLIENT" {
+            assert_eq!(args[1], "SETINFO");
+            conn.get_mut().write_all(b"+OK\r\n").await.unwrap();
+        } else {
+            assert_eq!(args[0], "EVAL");
+            return args;
+        }
+    }
+}
+
+async fn reply_snapshot(conn: &mut BufReader<TcpStream>, id: Uuid, raw: &str, receipts: usize) {
+    let args = redis_eval(conn).await;
+    assert_eq!(&args[2..], &["1", &format!("redops:policy:v1:{id}")]);
+    assert!(args[1].contains("HGET") && args[1].contains("HLEN"));
+    let reply = format!("*2\r\n${}\r\n{raw}\r\n:{receipts}\r\n", raw.len());
+    conn.get_mut().write_all(reply.as_bytes()).await.unwrap();
 }
 
 #[tokio::test]
-async fn distributed_trip_latches_on_acknowledgement_and_replay_only_resettles_receipt() {
-    let (m2, _) = MockM2::start().await;
-    let m3 = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let client = PolicyClient::new(
-        &format!("http://{}", m2.0.local_addr().unwrap()),
-        &format!("http://{}", m3.local_addr().unwrap()),
-    )
-    .unwrap();
-    let redis = MockRedis::start().await;
+async fn redis_settlement_consumes_a_receipt_before_counting_the_status() {
+    let (m2, policy) = MockM2::start().await;
+    let redis_pubsub = MockRedis::start().await;
     let breaker = Breaker::default();
-    let (mut subscription, task) = subscribe(&redis, &breaker).await;
-    let id = Uuid::from_u128(1);
-    let receipt = Uuid::from_u128(2);
-    let outcome = CompletionOutcome::OriginStatus(503);
-    let tripped = r#"{"breaker_tripped":true}"#;
+    let (mut subscription, listener_task) = subscribe(&redis_pubsub, &breaker).await;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let account =
+        redis::Client::open(format!("redis://{}/", listener.local_addr().unwrap())).unwrap();
+    let id = Uuid::from_u128(21);
+    let first = Uuid::from_u128(22);
+    let second = Uuid::from_u128(23);
+    let threshold = NonZeroU64::new(2).unwrap();
+    let mut stored = json!({"credit":120021,"at_us":1750000000000017_i64,"rate":2,"active_workers":2,"errors_5xx":7});
+    for (receipt, duplicate) in [(first, false), (first, true), (second, false)] {
+        let handle_cas = async {
+            let mut conn = BufReader::new(listener.accept().await.unwrap().0);
+            let workers = stored["active_workers"].as_u64().unwrap();
+            // Deliberately retain spaces. CAS must compare M3's exact original bytes.
+            let raw = serde_json::to_string_pretty(&stored).unwrap();
+            reply_snapshot(&mut conn, id, &raw, workers as usize).await;
+            let cas = redis_eval(&mut conn).await;
+            assert!(cas[1].contains("HSET") && cas[1].contains("HDEL"));
+            assert_eq!(&cas[2..5], &["1", &format!("redops:policy:v1:{id}"), &raw]);
+            assert_eq!(cas[6], receipt.to_string());
+            if duplicate {
+                conn.get_mut().write_all(b"+missing\r\n").await.unwrap();
+            } else {
+                stored["active_workers"] = json!(workers - 1);
+                stored["errors_5xx"] = json!(stored["errors_5xx"].as_u64().unwrap() + 1);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&cas[5]).unwrap(),
+                    stored
+                );
+                conn.get_mut().write_all(b"+ok\r\n").await.unwrap();
+            }
+        };
+        let (settled, ()) = tokio::join!(
+            breaker.settle(&account, &policy, id, receipt, 503, threshold),
+            handle_cas,
+        );
+        assert_eq!(
+            settled,
+            if duplicate {
+                Err(AccountingError::MissingReceipt)
+            } else {
+                Ok(())
+            }
+        );
+        assert_eq!(breaker.blocked(id), receipt == second);
+    }
+    let halt = m2.accept_stop(id, &breaker).await;
+    finish_stop(halt, id, Some(&mut subscription)).await;
+    assert_eq!(stored["active_workers"], 0);
+    assert_eq!(stored["errors_5xx"], 9);
+    listener_task.abort();
+}
 
-    let (unconfirmed, ()) = tokio::join!(
-        breaker.settle(&client, id, receipt, outcome),
-        acknowledge_settlement(&m3, id, receipt, "{}", None)
+#[tokio::test]
+async fn malformed_accounting_and_invalid_status_never_consume_receipts() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let client =
+        redis::Client::open(format!("redis://{}/", listener.local_addr().unwrap())).unwrap();
+    let id = Uuid::from_u128(17);
+    let receipt = Uuid::from_u128(19);
+    for status in [0, 199, 600] {
+        assert_eq!(
+            complete_reservation(&client, id, receipt, status).await,
+            Err(AccountingError::InvalidStatus)
+        );
+    }
+    let max_counter = format!(
+        r#"{{"credit":0,"at_us":1,"rate":1,"active_workers":1,"errors_5xx":{}}}"#,
+        "9".repeat(4300)
     );
-    assert_eq!(unconfirmed, Err(CompletionError::Unavailable));
-    assert!(!breaker.blocked(id));
+    for raw in [
+        max_counter.as_str(),
+        r#"{"credit":0,"at_us":1,"rate":1,"active_workers":2,"errors_5xx":0}"#,
+        r#"{"credit":1000001,"at_us":0,"rate":1,"active_workers":1,"errors_5xx":0}"#,
+        r#"{"credit":0,"at_us":1,"rate":0,"active_workers":1,"errors_5xx":0}"#,
+        r#"{"credit":0,"at_us":1,"rate":1,"active_workers":1,"errors_5xx":0,"x":0}"#,
+        r#"{"credit":0,"at_us":1,"rate":1,"active_workers":1,"errors_5xx":0,"errors_5xx":0}"#,
+    ] {
+        let (result, ()) = tokio::join!(complete_reservation(&client, id, receipt, 503), async {
+            let mut conn = BufReader::new(listener.accept().await.unwrap().0);
+            reply_snapshot(&mut conn, id, raw, 1).await;
+            let mut line = String::new();
+            assert_eq!(
+                conn.read_line(&mut line).await.unwrap(),
+                0,
+                "invalid snapshot generated a CAS"
+            );
+        });
+        assert_eq!(result, Err(AccountingError::InvalidState));
+    }
+}
 
-    let caller_breaker = breaker.clone();
-    let caller_policy = client.clone();
-    let caller = tokio::spawn(async move {
-        caller_breaker
-            .settle(&caller_policy, id, receipt, outcome)
-            .await
-    });
-    let abort = caller.abort_handle();
-    tokio::join!(
-        acknowledge_settlement(&m3, id, receipt, tripped, Some(&abort)),
-        async {
-            let stop = m2.accept_stop(id, &breaker).await;
-            finish_stop(stop, id, Some(&mut subscription)).await;
+#[tokio::test]
+async fn competing_redis_write_reloads_exact_snapshot_and_preserves_large_integers() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let client =
+        redis::Client::open(format!("redis://{}/", listener.local_addr().unwrap())).unwrap();
+    let id = Uuid::from_u128(13);
+    let receipt = Uuid::from_u128(15);
+    let (result, ()) = tokio::join!(complete_reservation(&client, id, receipt, 599), async {
+        let mut conn = BufReader::new(listener.accept().await.unwrap().0);
+        let large = "9".repeat(80);
+        let incremented = format!("1{}", "0".repeat(80));
+        for (attempt, at_us) in ["14", "15"].iter().enumerate() {
+            let raw = format!(
+                r#"{{"credit":{large},"at_us":{at_us},"rate":{large},"active_workers":1,"errors_5xx":{large}}}"#
+            );
+            reply_snapshot(&mut conn, id, &raw, 1).await;
+            let cas = redis_eval(&mut conn).await;
+            assert_eq!(cas[4], raw);
+            let updated = format!(
+                r#"{{"credit":{large},"at_us":{at_us},"rate":{large},"active_workers":0,"errors_5xx":{incremented}}}"#
+            );
+            assert_eq!(cas[5], updated);
+            assert_eq!(cas[6], receipt.to_string());
+            conn.get_mut()
+                .write_all(if attempt == 0 {
+                    b"+retry\r\n"
+                } else {
+                    b"+ok\r\n"
+                })
+                .await
+                .unwrap();
         }
-    );
-    assert!(caller.await.unwrap_err().is_cancelled());
-    assert!(breaker.blocked(id));
-    let (replay, ()) = tokio::join!(
-        breaker.settle(&client, id, receipt, outcome),
-        acknowledge_settlement(&m3, id, receipt, tripped, None)
-    );
-    assert_eq!(replay, Ok(true));
-    assert!(
-        timeout(Duration::from_millis(200), m2.0.accept())
-            .await
-            .is_err()
-    );
-    drop(m3);
-    assert_eq!(
-        breaker.settle(&client, id, receipt, outcome).await,
-        Err(CompletionError::Unavailable)
-    );
-    task.abort();
+    });
+    assert_eq!(result, Ok(()));
 }

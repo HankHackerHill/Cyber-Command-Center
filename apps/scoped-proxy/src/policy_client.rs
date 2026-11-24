@@ -1,4 +1,4 @@
-//! Clients for M2 state, M3 admission, and ADR-0012's proposed completion API.
+//! Clients for the M2 state and M3 admission APIs.
 //! Each successful evaluation reserves a worker in M3 and must be settled.
 
 use reqwest::{Client, Response, StatusCode, Url};
@@ -12,6 +12,14 @@ pub struct PolicyClient {
     http: Client,
     orchestrator: Url,
     policy: Url,
+    audit_authorization: Option<reqwest::header::HeaderValue>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuditError {
+    MissingCredential,
+    Rejected(StatusCode),
+    Unconfirmed,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -24,19 +32,6 @@ pub enum StateError {
 pub enum EvaluationError {
     Denied(String),
     Unavailable,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum CompletionError {
-    InvalidStatus,
-    Rejected(StatusCode),
-    Unavailable,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CompletionOutcome {
-    OriginStatus(u16),
-    NoOriginResponse,
 }
 
 /// These fields refer to the exact raw manifest whose digest selects M3's
@@ -140,7 +135,93 @@ impl PolicyClient {
             http,
             orchestrator,
             policy,
+            audit_authorization: None,
         })
+    }
+
+    pub fn with_audit_token(mut self, token: &str) -> Result<Self, &'static str> {
+        if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err("invalid M4 audit credential");
+        }
+        let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| "invalid M4 audit credential")?;
+        authorization.set_sensitive(true);
+        self.audit_authorization = Some(authorization);
+        Ok(self)
+    }
+
+    /// Verify that the orchestrator acknowledged this specific event. A retry
+    /// after a lost response uses the same key and the same immutable payload.
+    pub async fn audit_event(
+        &self,
+        engagement_id: Uuid,
+        event_id: Uuid,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> Result<String, AuditError> {
+        #[derive(Deserialize)]
+        struct Receipt {
+            seq_id: u64,
+            record_hash: String,
+            event: RecordedEvent,
+        }
+        #[derive(Deserialize)]
+        struct RecordedEvent {
+            event_id: Uuid,
+            engagement_id: Uuid,
+            actor_kind: String,
+            actor_id: String,
+            event_type: String,
+            payload: serde_json::Value,
+        }
+        let authorization = self
+            .audit_authorization
+            .as_ref()
+            .ok_or(AuditError::MissingCredential)?;
+        let mut url = self.orchestrator.clone();
+        url.set_path(&format!("/engagements/{engagement_id}/audit-events"));
+        let body = serde_json::json!({
+            "actor_kind":"SYSTEM", "actor_id":"scoped-proxy", "event_type":event_type,
+            "payload":payload,
+        });
+        for _ in 0..2 {
+            let response = self
+                .http
+                .post(url.clone())
+                .header(reqwest::header::AUTHORIZATION, authorization.clone())
+                .header("Idempotency-Key", event_id.to_string())
+                .json(&body)
+                .send()
+                .await;
+            let Ok(response) = response else { continue };
+            if response.status().is_server_error() {
+                continue;
+            }
+            if !matches!(response.status(), StatusCode::OK | StatusCode::CREATED) {
+                return Err(AuditError::Rejected(response.status()));
+            }
+            let Some(receipt) = read_json::<Receipt>(response).await else {
+                continue;
+            };
+            let event = receipt.event;
+            if receipt.seq_id > 0
+                && receipt.record_hash.len() == 64
+                && receipt
+                    .record_hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && event.event_id == event_id
+                && event.engagement_id == engagement_id
+                && event.actor_kind == "SYSTEM"
+                && event.actor_id == "scoped-proxy"
+                && event.event_type == event_type
+                && event.payload == payload
+            {
+                return Ok(receipt.record_hash);
+            }
+            return Err(AuditError::Unconfirmed);
+        }
+        Err(AuditError::Unconfirmed)
     }
 
     /// This checks invariant 3 only. M3 separately enforces active validation.
@@ -273,56 +354,22 @@ impl PolicyClient {
             return Err(EvaluationError::Unavailable);
         }
         if !decision.allow {
+            let event_id = Uuid::new_v4();
+            let payload = serde_json::json!({
+                "reason": decision.reason, "method": request.method, "host": request.host,
+                "manifest_hash": manifest.digest
+            });
+            if let Err(error) = self
+                .audit_event(manifest.engagement_id, event_id, "POLICY_DENIED", payload)
+                .await
+            {
+                eprintln!("Policy denial {event_id} audit append unconfirmed: {error:?}");
+            }
             return Err(EvaluationError::Denied(decision.reason));
         }
         if status != StatusCode::OK || duplicate {
             return Err(EvaluationError::Unavailable);
         }
         receipt.ok_or(EvaluationError::Unavailable)
-    }
-
-    /// Settle one reservation with its observed outcome. A lost or invalid
-    /// acknowledgement leaves settlement unconfirmed. ADR-0012 permits a retry
-    /// with the same receipt and status.
-    pub async fn complete(
-        &self,
-        id: Uuid,
-        reservation: Uuid,
-        outcome: CompletionOutcome,
-    ) -> Result<bool, CompletionError> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Acknowledgement {
-            breaker_tripped: bool,
-        }
-        let body = match outcome {
-            CompletionOutcome::OriginStatus(status @ 200..=599) => {
-                serde_json::json!({"status_code":status})
-            }
-            CompletionOutcome::OriginStatus(_) => return Err(CompletionError::InvalidStatus),
-            CompletionOutcome::NoOriginResponse => {
-                serde_json::json!({"outcome":"no_origin_response"})
-            }
-        };
-        let mut url = self.policy.clone();
-        url.set_path(&format!("/engagements/{id}/completions"));
-        let response = self
-            .http
-            .post(url)
-            .header("X-Policy-Reservation", reservation.to_string())
-            .json(&body)
-            .send()
-            .await
-            .map_err(|_| CompletionError::Unavailable)?;
-        match response.status() {
-            StatusCode::OK => read_json::<Acknowledgement>(response)
-                .await
-                .map(|ack| ack.breaker_tripped)
-                .ok_or(CompletionError::Unavailable),
-            status @ (StatusCode::NOT_FOUND
-            | StatusCode::CONFLICT
-            | StatusCode::UNPROCESSABLE_ENTITY) => Err(CompletionError::Rejected(status)),
-            _ => Err(CompletionError::Unavailable),
-        }
     }
 }

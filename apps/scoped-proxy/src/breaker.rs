@@ -8,17 +8,155 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use serde::Deserialize;
+use num_bigint::BigUint;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, watch};
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
-use crate::policy_client::{CompletionError, CompletionOutcome, PolicyClient, StateError};
+use crate::policy_client::{PolicyClient, StateError};
 
 const CHANNEL: &str = "redops:killswitch";
 const REDIS_TIMEOUT: Duration = Duration::from_secs(2);
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+// These commands mirror AccountStore._read and AccountStore.complete in M3.
+// Neither script allocates a bucket or resets an engagement's limits.
+const READ_ACCOUNT: &str =
+    "return {redis.call('HGET', KEYS[1], 'state'), redis.call('HLEN', KEYS[1]) - 1}";
+const COMPLETE_ACCOUNT: &str = "
+if redis.call('HGET', KEYS[1], ARGV[3]) ~= '1' then return 'missing' end
+if redis.call('HGET', KEYS[1], 'state') ~= ARGV[1] then return 'retry' end
+redis.call('HSET', KEYS[1], 'state', ARGV[2])
+redis.call('HDEL', KEYS[1], ARGV[3])
+return 'ok'";
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AccountingError {
+    InvalidStatus,
+    InvalidState,
+    MissingReceipt,
+    Busy,
+    Unavailable,
+}
+
+// M3's nonnegative Python integers are decimal JSON numbers. Its Pydantic
+// JSON parser accepts at most 4300 digits. Do not write an unreadable bucket.
+mod integer {
+    use num_bigint::BigUint;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_json::value::RawValue;
+
+    const MAX_DIGITS: usize = 4300;
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(input: D) -> Result<BigUint, D::Error> {
+        let raw = <&RawValue>::deserialize(input)?;
+        match raw.get() {
+            "-0" => Ok(BigUint::ZERO),
+            text if text.len() > MAX_DIGITS => Err(serde::de::Error::custom("integer too large")),
+            text => BigUint::parse_bytes(text.as_bytes(), 10)
+                .ok_or_else(|| serde::de::Error::custom("expected a nonnegative integer")),
+        }
+    }
+
+    pub fn serialize<S: Serializer>(value: &BigUint, output: S) -> Result<S::Ok, S::Error> {
+        let digits = value.to_str_radix(10);
+        if digits.len() > MAX_DIGITS {
+            return Err(serde::ser::Error::custom("integer too large"));
+        }
+        RawValue::from_string(digits)
+            .map_err(serde::ser::Error::custom)?
+            .serialize(output)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Bucket {
+    #[serde(with = "integer")]
+    credit: BigUint,
+    #[serde(with = "integer")]
+    at_us: BigUint,
+    #[serde(with = "integer")]
+    rate: BigUint,
+    #[serde(with = "integer")]
+    active_workers: BigUint,
+    #[serde(with = "integer")]
+    errors_5xx: BigUint,
+}
+
+/// Release exactly one M3 reservation, retaining its original rate debit.
+/// Only a confirmed Redis CAS counts as a completion. A lost acknowledgement
+/// can leave an already-consumed receipt indistinguishable from a missing one.
+pub async fn complete_reservation(
+    redis: &redis::Client,
+    id: Uuid,
+    reservation: Uuid,
+    status: u16,
+) -> Result<(), AccountingError> {
+    if !(200..=599).contains(&status) {
+        return Err(AccountingError::InvalidStatus);
+    }
+    let key = format!("redops:policy:v1:{id}");
+    let receipt = reservation.to_string();
+    timeout(REDIS_TIMEOUT, async {
+        let mut connection = redis
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|_| AccountingError::Unavailable)?;
+        for _ in 0..12 {
+            let (raw, receipts): (Option<String>, i64) = redis::cmd("EVAL")
+                .arg(READ_ACCOUNT)
+                .arg(1)
+                .arg(&key)
+                .query_async(&mut connection)
+                .await
+                .map_err(|_| AccountingError::Unavailable)?;
+            let raw = raw.ok_or(AccountingError::InvalidState)?;
+            let mut bucket: Bucket =
+                serde_json::from_str(&raw).map_err(|_| AccountingError::InvalidState)?;
+            let receipts = u64::try_from(receipts).map_err(|_| AccountingError::InvalidState)?;
+            if bucket.active_workers != BigUint::from(receipts)
+                || bucket.credit > &bucket.rate * 1_000_000_u32
+                || (bucket.rate == BigUint::ZERO
+                    && (bucket.at_us != BigUint::ZERO
+                        || receipts != 0
+                        || bucket.errors_5xx != BigUint::ZERO))
+            {
+                return Err(AccountingError::InvalidState);
+            }
+            if receipts == 0 {
+                return Err(AccountingError::MissingReceipt);
+            }
+            bucket.active_workers -= 1_u32;
+            if status >= 500 {
+                bucket.errors_5xx += 1_u32;
+            }
+            let updated =
+                serde_json::to_string(&bucket).map_err(|_| AccountingError::InvalidState)?;
+            let answer: String = redis::cmd("EVAL")
+                .arg(COMPLETE_ACCOUNT)
+                .arg(1)
+                .arg(&key)
+                .arg(&raw)
+                .arg(updated)
+                .arg(&receipt)
+                .query_async(&mut connection)
+                .await
+                .map_err(|_| AccountingError::Unavailable)?;
+            match answer.as_str() {
+                "ok" => return Ok(()),
+                "missing" => return Err(AccountingError::MissingReceipt),
+                "retry" => continue,
+                _ => return Err(AccountingError::Unavailable),
+            }
+        }
+        Err(AccountingError::Busy)
+    })
+    .await
+    .map_err(|_| AccountingError::Unavailable)?
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -145,30 +283,32 @@ impl Breaker {
         Err("killswitch subscription lost".into())
     }
 
-    /// Settle one receipt under the proposed ADR-0012 M3 contract. M3's
-    /// acknowledgement orders consecutive responses across proxy processes.
-    /// Replays use the same receipt and outcome, including after a local stop.
+    /// Update M3's cumulative accounting, then observe the single confirmed
+    /// origin result in this process's consecutive breaker. Outstanding
+    /// receipts can still be settled after a stop.
     pub async fn settle(
         &self,
+        redis: &redis::Client,
         policy: &PolicyClient,
         id: Uuid,
         reservation: Uuid,
-        outcome: CompletionOutcome,
-    ) -> Result<bool, CompletionError> {
-        // A client disconnect while M3 is replying must not discard a trip.
+        status: u16,
+        threshold: NonZeroU64,
+    ) -> Result<(), AccountingError> {
+        // A client disconnect after Redis receives the CAS must not discard
+        // a confirmed observation or the corresponding M2 halt.
         let breaker = self.clone();
+        let redis = redis.clone();
         let policy = policy.clone();
         tokio::spawn(async move {
-            let tripped = policy.complete(id, reservation, outcome).await?;
-            if tripped && breaker.state().latch(id) {
-                // M3 settlement is confirmed. M2's separate, idempotent
-                // halt proceeds until it confirms publication.
+            complete_reservation(&redis, id, reservation, status).await?;
+            if breaker.observe(id, status, threshold) {
                 drop(breaker.deliver_stop(id, &policy));
             }
-            Ok(tripped)
+            Ok(())
         })
         .await
-        .map_err(|_| CompletionError::Unavailable)?
+        .map_err(|_| AccountingError::Unavailable)?
     }
 
     /// Process-local observer for a stream of distinct final origin responses.
@@ -185,27 +325,28 @@ impl Breaker {
         if !(200..=599).contains(&status) {
             return Err("expected a final HTTP response status".into());
         }
-        {
-            let mut state = self.state();
-            if state.stopped.contains(&id) {
-                return Ok(());
-            }
-            if status < 500 {
-                state.consecutive.remove(&id);
-                return Ok(());
-            }
-            let streak = state.consecutive.entry(id).or_default();
-            *streak = streak.saturating_add(1);
-            if *streak < threshold.get() {
-                return Ok(());
-            }
-            state.latch(id);
+        if !self.observe(id, status, threshold) {
+            return Ok(());
         }
         self.deliver_stop(id, policy)
             .await
             .map_err(|_| "killswitch delivery task stopped")?
             .map_err(|_| "orchestrator did not confirm killswitch publication")?;
         Ok(())
+    }
+
+    fn observe(&self, id: Uuid, status: u16, threshold: NonZeroU64) -> bool {
+        let mut state = self.state();
+        if state.stopped.contains(&id) {
+            return false;
+        }
+        if status < 500 {
+            state.consecutive.remove(&id);
+            return false;
+        }
+        let streak = state.consecutive.entry(id).or_default();
+        *streak = streak.saturating_add(1);
+        *streak >= threshold.get() && state.latch(id)
     }
 
     fn deliver_stop(

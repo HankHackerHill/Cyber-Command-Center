@@ -1,10 +1,11 @@
 //! Ingress diagnostic for an already acknowledged CONNECT. The listener keeps
-//! denying before 200 while TLS inspection and durable audit append are unavailable.
+//! denying before 200 while the origin transport is unavailable.
 
 use std::{fmt::Write as _, io, time::Duration};
 
 use bytes::Bytes;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     time::{Instant, timeout, timeout_at},
@@ -12,6 +13,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::evidence_client::{EvidenceClient, EvidenceError};
+use crate::policy_client::{AuditError, PolicyClient};
 
 const MAX_PREFIX: usize = 16;
 const MAX_WAIT: Duration = Duration::from_millis(250);
@@ -32,14 +34,15 @@ pub struct RejectionRecord {
 }
 
 #[derive(Debug)]
-pub struct PendingAudit {
+pub struct RejectedTunnel {
     pub record: RejectionRecord,
     pub evidence_result: Result<(), EvidenceError>,
+    pub audit_result: Result<String, AuditError>,
     pub read_error: Option<io::Error>,
     pub close_result: io::Result<()>,
 }
 
-#[must_use = "TLS candidates require handshake validation and rejections require durable audit"]
+#[must_use = "TLS candidates require handshake validation and rejection acknowledgements must be checked"]
 pub enum Ingress<S> {
     /// Replay the complete prefix, then continue reading the client stream.
     /// The plaintext record header and first handshake type identify a candidate.
@@ -47,7 +50,7 @@ pub enum Ingress<S> {
         prefix: Bytes,
         client: S,
     },
-    RejectedPendingAudit(PendingAudit),
+    Rejected(RejectedTunnel),
 }
 
 /// Inspect at most sixteen client bytes under one deadline across all reads.
@@ -58,6 +61,7 @@ pub async fn classify_ingress<S: AsyncRead + AsyncWrite + Unpin>(
     diagnostic_id: Uuid,
     peek_timeout: Duration,
     evidence: &EvidenceClient,
+    policy: &PolicyClient,
 ) -> Ingress<S> {
     let deadline = Instant::now() + peek_timeout.min(MAX_WAIT);
     let mut prefix = [0_u8; MAX_PREFIX];
@@ -112,10 +116,23 @@ pub async fn classify_ingress<S: AsyncRead + AsyncWrite + Unpin>(
         prefix_hex,
     };
     let artifact = serde_json::to_vec(&record).expect("UUIDs, strings and unit variants serialize");
+    let digest = format!("{:x}", Sha256::digest(&artifact));
     let evidence_result = evidence.put(Bytes::from(artifact)).await;
-    Ingress::RejectedPendingAudit(PendingAudit {
+    let audit_result = policy
+        .audit_event(
+            engagement_id,
+            diagnostic_id,
+            "TUNNEL_REJECTED",
+            serde_json::json!({
+                "reason":record.reason, "prefix_hex":record.prefix_hex, "phase":"after_200",
+                "evidence_sha256":digest, "evidence_acknowledged":evidence_result.is_ok()
+            }),
+        )
+        .await;
+    Ingress::Rejected(RejectedTunnel {
         record,
         evidence_result,
+        audit_result,
         read_error,
         close_result,
     })

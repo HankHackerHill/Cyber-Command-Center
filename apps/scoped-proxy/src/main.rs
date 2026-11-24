@@ -70,22 +70,38 @@ async fn handle(req: Request<Incoming>, policy: &PolicyClient, breaker: &Breaker
         Err(StateError::Unavailable) => deny(StatusCode::SERVICE_UNAVAILABLE, "STATE_UNAVAILABLE"),
         // Opaque tunnels cannot enforce the per-request attribution and
         // evidence requirements of invariant 4.
-        Ok(()) if req.method() == Method::CONNECT => deny(
-            StatusCode::FORBIDDEN,
-            tls::RejectionReason::OpaqueTunnelNotAllowed,
-        ),
-        // /evaluate mutates M3 accounting on allow. M3 on this branch has no
-        // service endpoint for releasing that reservation. Fail before reserve.
-        Ok(()) => deny(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "POLICY_COMPLETION_UNAVAILABLE",
-        ),
+        Ok(()) if req.method() == Method::CONNECT => {
+            let reason = tls::RejectionReason::OpaqueTunnelNotAllowed;
+            let event_id = Uuid::new_v4();
+            let payload =
+                serde_json::json!({"reason":reason, "phase":"before_200", "prefix_hex":""});
+            let policy = policy.clone();
+            // A stop must interrupt the client response even when the ledger
+            // is slow. The append can still finish under its idempotency key.
+            let append = tokio::spawn(async move {
+                if let Err(error) = policy
+                    .audit_event(id, event_id, "TUNNEL_REJECTED", payload)
+                    .await
+                {
+                    eprintln!("Tunnel rejection {event_id} audit append unconfirmed: {error:?}");
+                }
+            });
+            tokio::select! {
+                biased;
+                () = breaker.wait_blocked(id) => stop_response(breaker),
+                _ = append => deny(StatusCode::FORBIDDEN, reason),
+            }
+        }
+        // The listener has no origin transport. Reserving at this point
+        // would consume a worker with no final origin status to report.
+        Ok(()) => deny(StatusCode::NOT_IMPLEMENTED, "FORWARDING_UNAVAILABLE"),
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let policy = PolicyClient::new(&env::var("ORCHESTRATOR_URL")?, &env::var("POLICY_URL")?)?;
+    let policy = PolicyClient::new(&env::var("ORCHESTRATOR_URL")?, &env::var("POLICY_URL")?)?
+        .with_audit_token(&env::var("M4_AUDIT_TOKEN")?)?;
     let redis = redis::Client::open(env::var("REDIS_URL")?)?;
     let listen: SocketAddr = env::var("SCOPED_PROXY_LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:8080".into())
