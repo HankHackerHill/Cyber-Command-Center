@@ -3,6 +3,7 @@
 import json
 import os
 import secrets
+import sqlite3
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from decimal import Decimal, InvalidOperation
@@ -17,11 +18,13 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from psycopg_pool import ConnectionPool
+from psycopg import Error as PostgresError
+from psycopg_pool import ConnectionPool, PoolTimeout
 from pydantic import BaseModel
 from redis import Redis
 from redis.exceptions import RedisError
 
+from audit_delivery import AuditDelivery, AuditOutbox, QueuedAudit, audit_receipt, lock_engagement
 from deps import Services, services
 from ledger import (
     AuditReplayConflict, EngagementNotFound, get_state, halt_engagement, read_ledger,
@@ -77,10 +80,11 @@ async def validate_audit_wire(request: Request) -> None:
 def create_app(
     *, database_url: str | None = None, redis_url: str | None = None,
     trusted_public_keys: Mapping[str, Ed25519PublicKey] | None = None,
-    m4_audit_token: str | None = None,
+    m4_audit_token: str | None = None, audit_outbox_path: str | None = None,
 ) -> FastAPI:
     keys = dict(trusted_public_keys) if trusted_public_keys is not None else load_operator_public_keys()
     audit_token = m4_audit_token if m4_audit_token is not None else os.getenv("M4_AUDIT_TOKEN")
+    outbox_path = audit_outbox_path or os.getenv("ORCHESTRATOR_AUDIT_OUTBOX")
 
     async def authenticate_m4(
         request: Request,
@@ -103,7 +107,17 @@ def create_app(
                            socket_connect_timeout=0.25, socket_timeout=0.25) as publisher,
         ):
             app.state.services = Services(pool, publisher)
-            yield
+            outbox = AuditOutbox(outbox_path) if outbox_path else None
+            delivery = AuditDelivery(outbox, pool) if outbox is not None else None
+            app.state.audit_outbox = outbox
+            app.state.audit_delivery = delivery
+            if delivery is not None:
+                delivery.start()
+            try:
+                yield
+            finally:
+                if delivery is not None:
+                    delivery.stop()
 
     app = FastAPI(lifespan=lifespan)
 
@@ -137,6 +151,7 @@ def create_app(
         dependencies=[Depends(authenticate_m4), Depends(validate_audit_wire)],
         responses={
             200: {"model": LedgerRecord, "description": "Idempotent replay"},
+            202: {"model": QueuedAudit, "description": "Durably queued with Prefer: respond-async"},
             401: {"description": "Invalid service credential"},
             403: {"description": "Actor does not match the authenticated service"},
             404: {"description": "Unknown engagement"},
@@ -144,21 +159,77 @@ def create_app(
         },
     )
     def append_audit(
-        id: UUID, event: AuditEvent, resources: Resources, response: Response,
+        id: UUID, event: AuditEvent, resources: Resources, response: Response, request: Request,
+        prefer: Annotated[str | None, Header()] = None,
         idempotency_keys: Annotated[list[UUID] | None, Header(alias="Idempotency-Key")] = None,
-    ) -> LedgerRecord:
+    ) -> LedgerRecord | QueuedAudit:
         if event.actor_kind != ActorType.SYSTEM or event.actor_id != "scoped-proxy":
             raise HTTPException(403, "Actor identity does not match the authenticated service")
         if idempotency_keys is not None and len(idempotency_keys) != 1:
             raise HTTPException(422, "Expected a single Idempotency-Key")
+        asynchronous = prefer is not None and any(
+            part.strip().lower() == "respond-async" for part in prefer.split(",")
+        )
+        key = idempotency_keys[0] if idempotency_keys else None
+        if asynchronous and key is None:
+            raise HTTPException(422, "Asynchronous audit delivery requires an Idempotency-Key")
+        outbox: AuditOutbox | None = request.app.state.audit_outbox
+        if asynchronous and outbox is None:
+            raise HTTPException(503, "Asynchronous audit delivery is not configured")
         with resources.database.connection() as conn:
             try:
-                key = idempotency_keys[0] if idempotency_keys else None
-                receipt, created = record_audit_event(conn, id, event, key)
+                if outbox is None:
+                    receipt, created = record_audit_event(conn, id, event, key)
+                else:
+                    with conn.transaction():
+                        # Serialize reservation versus synchronous append across processes.
+                        # Transition append and signature/guard logic remain in ledger.py.
+                        lock_engagement(conn, id)
+                        if key is not None:
+                            outbox.check(id, key, event)
+                        if asynchronous:
+                            assert key is not None
+                            prior = audit_receipt(conn, id, key, event)
+                            if prior is not None:
+                                response.status_code = 200
+                                return prior
+                            outbox.enqueue(id, key, event)
+                            response.status_code = 202
+                            return QueuedAudit(engagement_id=id, event_id=key)
+                        receipt, created = record_audit_event(conn, id, event, key)
             except AuditReplayConflict as exc:
                 raise HTTPException(409, "Idempotency-Key was used for a different event") from exc
+            except (sqlite3.Error, OSError) as exc:
+                raise HTTPException(503, "Durable audit delivery unavailable") from exc
         response.status_code = 201 if created else 200
         return receipt
+
+    @app.get(
+        "/engagements/{id}/audit-events/{event_id}", response_model_by_alias=False,
+        dependencies=[Depends(authenticate_m4)],
+        responses={202: {"model": QueuedAudit}, 404: {"description": "Unknown audit event"}},
+    )
+    def poll_audit(id: UUID, event_id: UUID, resources: Resources,
+                   request: Request, response: Response) -> LedgerRecord | QueuedAudit:
+        outbox: AuditOutbox | None = request.app.state.audit_outbox
+        local = outbox.lookup(id, event_id) if outbox is not None else None
+        if isinstance(local, LedgerRecord):
+            return local
+        try:
+            with resources.database.connection(timeout=0.25) as conn:
+                with conn.transaction():
+                    conn.execute("SET LOCAL statement_timeout = '1000ms'")
+                    prior = audit_receipt(conn, id, event_id)
+        except (PostgresError, PoolTimeout) as exc:
+            if local is None:
+                raise HTTPException(503, "Audit receipt lookup unavailable") from exc
+            prior = None
+        if prior is not None:
+            return prior
+        if local is not None:
+            response.status_code = 202
+            return local
+        raise HTTPException(404, "Unknown audit event")
 
     @app.post("/engagements/{id}/killswitch")
     def killswitch(id: UUID, resources: Resources) -> StopResponse:
