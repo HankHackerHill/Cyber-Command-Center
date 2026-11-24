@@ -122,6 +122,16 @@ def record_review_transition(
     with conn.transaction():
         if _lock_engagement(conn, engagement_id) != event.from_state:
             raise TransitionDenied(Reason.STATE_MISMATCH, 409)
+        # Cycles must not make an already consumed approval valid a second time.
+        # Audit-only event IDs occupy a separate namespace from transitions.
+        prior = conn.execute(
+            """SELECT 1 FROM immutable_audit_log
+               WHERE engagement_id = %s AND payload ? 'from_state'
+                 AND payload->>'event_id' = %s LIMIT 1""",
+            (engagement_id, event.event_id),
+        ).fetchone()
+        if prior is not None:
+            raise TransitionDenied(Reason.EVENT_REPLAY, 409)
         previous = _tail_hash(conn, engagement_id) or GENESIS_HASH
         digest = hash_record(previous, event)
         conn.execute(

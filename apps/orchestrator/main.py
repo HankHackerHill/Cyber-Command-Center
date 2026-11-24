@@ -1,4 +1,4 @@
-"""Engagement audit, remediation, signed closure, and emergency stop API."""
+"""Governed engagement progression, audit journal, and emergency stop API."""
 
 import json
 import os
@@ -178,18 +178,21 @@ def create_app(
         responses={
             403: {
                 "model": TransitionError,
-                "description": "Signature check failed or the requested transition is deferred.",
+                "description": "A required human signature is missing or invalid, or an optional signature is invalid.",
             },
             404: {"model": TransitionError, "description": "Engagement not found."},
-            409: {"model": TransitionError, "description": "Illegal transition or stale source state."},
+            409: {"model": TransitionError, "description": "Illegal transition, stale source state, or reused transition event ID."},
             422: {"model": TransitionError, "description": "Invalid event or mismatched engagement ID."},
         },
     )
     def transition(id: UUID, event: TransitionEvent, resources: Resources) -> ReviewResponse | StopResponse:
-        """Record evidence review, remediation, signed closure, or an emergency stop.
+        """Apply an allowed transition and append its audit record atomically.
 
-        An otherwise valid request for a deferred transition returns HTTP 403 with
-        reason `TRANSITION_UNAVAILABLE`. The engagement state and audit ledger stay intact.
+        Entry to ROE_LOCKED, CONTROLLED_VALIDATION, and COMPLETED_ARCHIVED
+        requires a trusted human signature, including manual reset after a halt.
+        Applied transition event IDs cannot be reused within an engagement.
+        Emergency stops use the idempotent killswitch handler regardless of the
+        submitted source state.
         """
         if event.to_state == EngagementState.HALTED_KILLSWITCH:
             require_engagement_id(id, event)

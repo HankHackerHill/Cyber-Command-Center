@@ -1,5 +1,7 @@
-"""Live database tests for archival, evidence review, and remediation handoffs."""
+"""Live database acceptance tests for the authoritative transition graph."""
 
+import hashlib
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -10,10 +12,11 @@ import httpx
 import psycopg
 import pytest
 from contracts.events import ActorType, Ed25519Signature, EngagementState, TransitionEvent
+from contracts.ledger import LedgerRecord
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
-from ledger import GENESIS_HASH, get_state, hash_record, read_ledger
+from ledger import GENESIS_HASH, get_state, hash_record, read_ledger, record_review_transition
 from main import create_app
 
 
@@ -39,6 +42,55 @@ def archive_request(
         signer_id=actor, signature=key.sign(event.canonical_envelope()).hex(),
     )
     return event.model_copy(update={"hitl_signature": signature})
+
+
+def transition_request(
+    engagement: UUID, source: EngagementState, destination: EngagementState,
+    key: Ed25519PrivateKey | None = None, actor_type: ActorType = ActorType.HUMAN_OPERATOR,
+) -> TransitionEvent:
+    event = TransitionEvent(
+        event_id=str(uuid4()), engagement_id=str(engagement), from_state=source, to_state=destination,
+        actor_type=actor_type, actor_id="scope-reviewer", occurred_at=datetime.now(timezone.utc),
+    )
+    if key is None:
+        return event
+    return event.model_copy(update={"hitl_signature": Ed25519Signature(
+        signer_id=event.actor_id, signature=key.sign(event.canonical_envelope()).hex(),
+    )})
+
+
+def assert_journal(
+    client: TestClient, database: str, engagement: UUID, state: EngagementState,
+    events: list[TransitionEvent], key: Ed25519PrivateKey | None = None,
+) -> list[LedgerRecord]:
+    """Compare API and committed DB data, independently recomputing every byte/hash."""
+    state_response = client.get(f"/engagements/{engagement}/state")
+    assert state_response.status_code == 200, state_response.text
+    assert state_response.json() == {"state": state.value}
+    response = client.get(f"/engagements/{engagement}/ledger")
+    assert response.status_code == 200, response.text
+    records = [LedgerRecord.model_validate(row) for row in response.json()]
+    with psycopg.connect(database) as reader:
+        assert get_state(reader, engagement) == state
+        assert read_ledger(reader, engagement, 0) == records
+    assert [record.event for record in records] == events
+    previous, sequence = GENESIS_HASH, 0
+    for record, event in zip(records, events, strict=True):
+        assert record.seq_id > sequence
+        assert record.prev_record_hash == previous
+        envelope = json.dumps(
+            event.model_dump(mode="json", exclude={"hitl_signature"}), sort_keys=True,
+            separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+        assert event.canonical_envelope() == envelope
+        if event.hitl_signature is not None:
+            assert key is not None
+            key.public_key().verify(bytes.fromhex(event.hitl_signature.signature), envelope)
+        body = json.dumps(event.model_dump(mode="json"), sort_keys=True, ensure_ascii=False,
+                          separators=(",", ":"), allow_nan=False).encode("utf-8")
+        assert record.record_hash == hashlib.sha256(bytes.fromhex(previous) + body).hexdigest()
+        previous, sequence = record.record_hash, record.seq_id
+    return records
 
 
 def test_competing_signed_archives_commit_one_winner(urls: tuple[str, str]) -> None:
@@ -151,36 +203,53 @@ def test_archive_denial_is_atomic_for_each_invalid_signature(urls: tuple[str, st
 @pytest.mark.parametrize(
     ("source", "destination"),
     [
+        (EngagementState.INIT_SCOPING, EngagementState.ROE_LOCKED),
+        (EngagementState.ROE_LOCKED, EngagementState.DISCOVERY_PASSIVE),
+        (EngagementState.DISCOVERY_PASSIVE, EngagementState.ANALYTICAL_TRIAGE),
+        (EngagementState.ANALYTICAL_TRIAGE, EngagementState.AWAITING_HITL_GATE),
+        (EngagementState.AWAITING_HITL_GATE, EngagementState.CONTROLLED_VALIDATION),
+        (EngagementState.AWAITING_HITL_GATE, EngagementState.ANALYTICAL_TRIAGE),
         (EngagementState.CONTROLLED_VALIDATION, EngagementState.EVIDENCE_VERIFICATION),
         (EngagementState.DISCOVERY_PASSIVE, EngagementState.REMEDIATION_SYNTHESIS),
         (EngagementState.ANALYTICAL_TRIAGE, EngagementState.REMEDIATION_SYNTHESIS),
         (EngagementState.EVIDENCE_VERIFICATION, EngagementState.REMEDIATION_SYNTHESIS),
+        (EngagementState.EVIDENCE_VERIFICATION, EngagementState.ANALYTICAL_TRIAGE),
+        (EngagementState.REMEDIATION_SYNTHESIS, EngagementState.RETEST_VERIFICATION),
+        (EngagementState.REMEDIATION_SYNTHESIS, EngagementState.COMPLETED_ARCHIVED),
         (EngagementState.RETEST_VERIFICATION, EngagementState.REMEDIATION_SYNTHESIS),
+        (EngagementState.RETEST_VERIFICATION, EngagementState.COMPLETED_ARCHIVED),
     ],
 )
-def test_evidence_and_remediation_handoffs(
+def test_all_running_nonstop_handoffs(
     urls: tuple[str, str], source: EngagementState, destination: EngagementState,
 ) -> None:
     database, redis = urls
     engagement = uuid4()
-    event = TransitionEvent(
-        engagement_id=str(engagement), event_id=str(uuid4()), from_state=source, to_state=destination,
-        actor_type=ActorType.HUMAN_OPERATOR, actor_id="report-reviewer", occurred_at=datetime.now(timezone.utc),
+    key = Ed25519PrivateKey.generate()
+    event = transition_request(
+        engagement, source, destination,
+        key if destination in {
+            EngagementState.ROE_LOCKED, EngagementState.CONTROLLED_VALIDATION,
+            EngagementState.COMPLETED_ARCHIVED,
+        } else None,
     )
     previous = GENESIS_HASH
+    events: list[TransitionEvent] = []
     with psycopg.connect(database) as connection:
         connection.execute("INSERT INTO engagements (id, current_state) VALUES (%s, %s)", (engagement, source))
         if source == EngagementState.EVIDENCE_VERIFICATION:
             history = event.model_copy(update={
                 "event_id": str(uuid4()), "from_state": EngagementState.CONTROLLED_VALIDATION, "to_state": source,
             })
+            events.append(history)
             previous = hash_record(GENESIS_HASH, history)
             connection.execute(
                 """INSERT INTO immutable_audit_log (payload, prev_record_hash, record_hash)
                    VALUES (%s::jsonb, %s, %s)""", (history.model_dump_json(), GENESIS_HASH, previous),
             )
 
-    app = create_app(database_url=database, redis_url=redis, trusted_public_keys={})
+    app = create_app(database_url=database, redis_url=redis,
+                     trusted_public_keys={event.actor_id: key.public_key()})
     with TestClient(app) as client:
         path = f"/engagements/{engagement}/transition"
         payload = event.model_dump(mode="json", exclude_none=True)
@@ -196,8 +265,11 @@ def test_evidence_and_remediation_handoffs(
         latest = records[-1]
         assert latest.prev_record_hash == previous
         assert latest.event == event
+        events.append(event)
+        assert assert_journal(client, database, engagement, destination, events, key) == records
 
-        stale = client.post(path, json={**payload, "event_id": str(uuid4())})
+        # Replay the identical valid envelope so the row-lock state check decides.
+        stale = client.post(path, json=payload)
         assert stale.status_code == 409, stale.text
         assert stale.json()["reason"] == "STATE_MISMATCH"
         with psycopg.connect(database) as reader:
@@ -233,26 +305,201 @@ def test_remediation_preserves_and_checks_optional_signature(urls: tuple[str, st
         assert record.event == signed
 
 
-def test_deferred_scope_lock_is_denied_without_writes(urls: tuple[str, str]) -> None:
+@pytest.mark.parametrize(
+    ("source", "destination"),
+    [
+        (EngagementState.INIT_SCOPING, EngagementState.ROE_LOCKED),
+        (EngagementState.AWAITING_HITL_GATE, EngagementState.CONTROLLED_VALIDATION),
+    ],
+)
+def test_human_gate_is_denied_without_writes(
+    urls: tuple[str, str], source: EngagementState, destination: EngagementState,
+) -> None:
+    database, redis = urls
+    engagement = uuid4()
+    with psycopg.connect(database) as db:
+        db.execute("INSERT INTO engagements (id, current_state) VALUES (%s, %s)", (engagement, source))
+
+    key = Ed25519PrivateKey.generate()
+    signed = transition_request(engagement, source, destination, key)
+    app = create_app(database_url=database, redis_url=redis,
+                     trusted_public_keys={signed.actor_id: key.public_key()})
+    invalid = [
+        signed.model_copy(update={"hitl_signature": None}),
+        signed.model_copy(update={"event_id": str(uuid4())}),
+    ]
+    for actor_type in (ActorType.AI_AGENT, ActorType.SYSTEM):
+        # These envelopes have valid trusted-key signatures, but non-human actors.
+        nonhuman = transition_request(engagement, source, destination, key, actor_type)
+        assert nonhuman.hitl_signature is not None
+        key.public_key().verify(bytes.fromhex(nonhuman.hitl_signature.signature), nonhuman.canonical_envelope())
+        invalid.append(nonhuman)
+    with TestClient(app) as client:
+        assert_journal(client, database, engagement, source, [])
+        for event in invalid:
+            response = client.post(f"/engagements/{engagement}/transition", json=event.model_dump(mode="json"))
+            assert response.status_code == 403, response.text
+            assert response.json()["reason"] == "HUMAN_SIGNATURE_REQUIRED"
+            assert_journal(client, database, engagement, source, [])
+
+
+@pytest.mark.parametrize(
+    "states",
+    [
+        pytest.param([
+            EngagementState.INIT_SCOPING, EngagementState.ROE_LOCKED,
+            EngagementState.DISCOVERY_PASSIVE, EngagementState.ANALYTICAL_TRIAGE,
+            EngagementState.AWAITING_HITL_GATE, EngagementState.CONTROLLED_VALIDATION,
+            EngagementState.EVIDENCE_VERIFICATION, EngagementState.REMEDIATION_SYNTHESIS,
+            EngagementState.COMPLETED_ARCHIVED,
+        ], id="main-progression"),
+        pytest.param([
+            EngagementState.INIT_SCOPING, EngagementState.ROE_LOCKED,
+            EngagementState.DISCOVERY_PASSIVE, EngagementState.ANALYTICAL_TRIAGE,
+            EngagementState.AWAITING_HITL_GATE, EngagementState.ANALYTICAL_TRIAGE,
+            EngagementState.AWAITING_HITL_GATE, EngagementState.CONTROLLED_VALIDATION,
+            EngagementState.EVIDENCE_VERIFICATION, EngagementState.ANALYTICAL_TRIAGE,
+            EngagementState.REMEDIATION_SYNTHESIS, EngagementState.RETEST_VERIFICATION,
+            EngagementState.REMEDIATION_SYNTHESIS, EngagementState.RETEST_VERIFICATION,
+            EngagementState.COMPLETED_ARCHIVED,
+        ], id="triage-and-retest-loops"),
+    ],
+)
+def test_full_signed_assessment_progression(urls: tuple[str, str], states: list[EngagementState]) -> None:
     database, redis = urls
     engagement = uuid4()
     with psycopg.connect(database) as db:
         db.execute("INSERT INTO engagements (id) VALUES (%s)", (engagement,))
-
     key = Ed25519PrivateKey.generate()
-    event = TransitionEvent(
-        engagement_id=str(engagement), event_id=str(uuid4()), from_state=EngagementState.INIT_SCOPING,
-        to_state=EngagementState.ROE_LOCKED, actor_type=ActorType.HUMAN_OPERATOR,
-        actor_id="scope-reviewer", occurred_at=datetime.now(timezone.utc),
-    )
-    signature = Ed25519Signature(signer_id=event.actor_id, signature=key.sign(event.canonical_envelope()).hex())
-    signed = event.model_copy(update={"hitl_signature": signature})
-    app = create_app(database_url=database, redis_url=redis, trusted_public_keys={event.actor_id: key.public_key()})
-    with TestClient(app) as client, psycopg.connect(database, autocommit=True) as reader:
-        assert get_state(reader, engagement) == event.from_state
-        assert read_ledger(reader, engagement, 0) == []
-        response = client.post(f"/engagements/{engagement}/transition", json=signed.model_dump(mode="json"))
-        assert response.status_code == 403, response.text
-        assert response.json()["reason"] == "TRANSITION_UNAVAILABLE"
+    app = create_app(database_url=database, redis_url=redis,
+                     trusted_public_keys={"scope-reviewer": key.public_key()})
+    events: list[TransitionEvent] = []
+    with TestClient(app) as client:
+        assert_journal(client, database, engagement, states[0], [])
+        for source, destination in zip(states[:-1], states[1:], strict=True):
+            # Every hop is signed; in particular, all three human-only targets.
+            event = transition_request(engagement, source, destination, key)
+            response = client.post(f"/engagements/{engagement}/transition", json=event.model_dump(mode="json"))
+            assert response.status_code == 200, response.text
+            events.append(event)
+            records = assert_journal(client, database, engagement, destination, events, key)
+            assert response.json() == {
+                "status": "applied", "next_state": destination.value,
+                "ledger_hash": records[-1].record_hash,
+            }
+            # Cursor reads must expose this hop alone without replaying prior rows.
+            since = records[-2].seq_id if len(records) > 1 else 0
+            delta = client.get(f"/engagements/{engagement}/ledger", params={"since": since})
+            assert delta.status_code == 200, delta.text
+            assert [LedgerRecord.model_validate(row) for row in delta.json()] == records[-1:]
+
+
+def test_different_legal_transitions_race_from_existing_tail(urls: tuple[str, str]) -> None:
+    database, redis = urls
+    engagement = uuid4()
+    source = EngagementState.DISCOVERY_PASSIVE
+    history = transition_request(engagement, EngagementState.ROE_LOCKED, source)
+    previous = hash_record(GENESIS_HASH, history)
+    with psycopg.connect(database) as db:
+        db.execute("INSERT INTO engagements (id, current_state) VALUES (%s, %s)", (engagement, source))
+        db.execute(
+            """INSERT INTO immutable_audit_log (payload, prev_record_hash, record_hash)
+               VALUES (%s::jsonb, %s, %s)""", (history.model_dump_json(), GENESIS_HASH, previous),
+        )
+    events = [
+        transition_request(engagement, source, EngagementState.ANALYTICAL_TRIAGE),
+        transition_request(engagement, source, EngagementState.REMEDIATION_SYNTHESIS),
+    ]
+    assert events[0].to_state != events[1].to_state
+    app = create_app(database_url=database, redis_url=redis, trusted_public_keys={})
+    with TestClient(app) as client:
+        before = assert_journal(client, database, engagement, source, [history])
+        ready = Barrier(2, timeout=10)
+
+        def post(event: TransitionEvent) -> httpx.Response:
+            ready.wait()
+            response = client.post(f"/engagements/{engagement}/transition", json=event.model_dump(mode="json"))
+            assert isinstance(response, httpx.Response)
+            return response
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            responses = list(pool.map(post, events))
+        assert sorted(response.status_code for response in responses) == [200, 409], [r.text for r in responses]
+        winner, applied = next((event, response) for event, response in zip(events, responses, strict=True)
+                               if response.status_code == 200)
+        loser, rejected = next((event, response) for event, response in zip(events, responses, strict=True)
+                               if response.status_code == 409)
+        assert rejected.json()["reason"] == "STATE_MISMATCH"
+        records = assert_journal(client, database, engagement, winner.to_state, [history, winner])
+        assert records[:-1] == before
+        assert records[-1].prev_record_hash == previous
+        assert records[-1].event != loser
+        assert applied.json() == {
+            "status": "applied", "next_state": winner.to_state.value, "ledger_hash": records[-1].record_hash,
+        }
+
+
+def test_manual_reset_requires_signed_human_and_extends_real_stop(urls: tuple[str, str]) -> None:
+    database, redis = urls
+    engagement = uuid4()
+    with psycopg.connect(database) as db:
+        db.execute("INSERT INTO engagements (id) VALUES (%s)", (engagement,))
+    key = Ed25519PrivateKey.generate()
+    app = create_app(database_url=database, redis_url=redis,
+                     trusted_public_keys={"scope-reviewer": key.public_key()})
+    with TestClient(app) as client:
+        locked = transition_request(engagement, EngagementState.INIT_SCOPING, EngagementState.ROE_LOCKED, key)
+        assert client.post(f"/engagements/{engagement}/transition", json=locked.model_dump(mode="json")).status_code == 200
+        stopped = client.post(f"/engagements/{engagement}/killswitch")
+        assert stopped.status_code == 200, stopped.text
+        with psycopg.connect(database) as reader:
+            prior, stop = read_ledger(reader, engagement, 0)
+        assert isinstance(stop.event, TransitionEvent)
+        assert stop.event.actor_type == ActorType.SYSTEM
+        assert stop.event.actor_id == "orchestrator:killswitch"
+        assert stop.event.from_state == EngagementState.ROE_LOCKED
+        assert stop.event.to_state == EngagementState.HALTED_KILLSWITCH
+        assert stop.record_hash == stopped.json()["ledger_hash"]
+        assert stop.prev_record_hash == prior.record_hash
+        events = [locked, stop.event]
+        before = assert_journal(client, database, engagement, EngagementState.HALTED_KILLSWITCH, events, key)
+        reset = transition_request(engagement, EngagementState.HALTED_KILLSWITCH, EngagementState.ROE_LOCKED, key)
+        for invalid in (
+            reset.model_copy(update={"hitl_signature": None}),
+            reset.model_copy(update={"event_id": str(uuid4())}),
+            transition_request(engagement, reset.from_state, reset.to_state, key, ActorType.AI_AGENT),
+            transition_request(engagement, reset.from_state, reset.to_state, key, ActorType.SYSTEM),
+        ):
+            denied = client.post(f"/engagements/{engagement}/transition", json=invalid.model_dump(mode="json"))
+            assert denied.status_code == 403, denied.text
+            assert denied.json()["reason"] == "HUMAN_SIGNATURE_REQUIRED"
+            assert assert_journal(client, database, engagement, reset.from_state, events, key) == before
+        response = client.post(f"/engagements/{engagement}/transition", json=reset.model_dump(mode="json"))
+        assert response.status_code == 200, response.text
+        events.append(reset)
+        records = assert_journal(client, database, engagement, EngagementState.ROE_LOCKED, events, key)
+        assert records[:-1] == before
+        assert records[-1].prev_record_hash == stop.record_hash
+        assert records[-1].record_hash == response.json()["ledger_hash"]
+
+
+def test_new_transition_rolls_back_when_journal_insert_fails(urls: tuple[str, str]) -> None:
+    database, _ = urls
+    engagement = uuid4()
+    key = Ed25519PrivateKey.generate()
+    event = transition_request(engagement, EngagementState.INIT_SCOPING, EngagementState.ROE_LOCKED, key)
+    with psycopg.connect(database, autocommit=True) as db:
+        db.execute("INSERT INTO engagements (id) VALUES (%s)", (engagement,))
+        # Session-local failure injection leaves the shared append-only table intact.
+        db.execute(
+            """CREATE TEMP TABLE immutable_audit_log (
+                   LIKE public.immutable_audit_log INCLUDING ALL, CHECK (false)
+               )"""
+        )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            record_review_transition(db, engagement, event, {event.actor_id: key.public_key()})
+        assert get_state(db, engagement) == event.from_state
+        assert read_ledger(db, engagement, 0) == []
+    with psycopg.connect(database) as reader:
         assert get_state(reader, engagement) == event.from_state
         assert read_ledger(reader, engagement, 0) == []
