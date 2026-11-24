@@ -1,7 +1,9 @@
 pub mod breaker;
 pub mod evidence_client;
+pub mod inspection;
 pub mod policy_client;
 pub mod tls;
+pub mod transport;
 
 use std::{convert::Infallible, env, error::Error, io, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -43,7 +45,12 @@ fn stop_response(breaker: &Breaker) -> Reply {
     }
 }
 
-async fn handle(req: Request<Incoming>, policy: &PolicyClient, breaker: &Breaker) -> Reply {
+async fn handle(
+    mut req: Request<Incoming>,
+    policy: &PolicyClient,
+    breaker: &Breaker,
+    transport: &transport::Transport,
+) -> Reply {
     if !breaker.ready() {
         return stop_response(breaker);
     }
@@ -55,11 +62,14 @@ async fn handle(req: Request<Incoming>, policy: &PolicyClient, breaker: &Breaker
     let Some(id) = id.filter(|_| ids.next().is_none()) else {
         return deny(StatusCode::BAD_REQUEST, "INVALID_ASSESSMENT_ID");
     };
+    let timing = transport::Timing::start();
+    let phase_started = tokio::time::Instant::now();
     let state = tokio::select! {
         biased;
         () = breaker.wait_blocked(id) => return stop_response(breaker),
         result = policy.check_state(id) => result,
     };
+    transport::Timing::record(&timing, "state", phase_started);
     if breaker.blocked(id) {
         return stop_response(breaker);
     }
@@ -68,16 +78,71 @@ async fn handle(req: Request<Incoming>, policy: &PolicyClient, breaker: &Breaker
             deny(StatusCode::PRECONDITION_FAILED, "PRECONDITION_FAILED")
         }
         Err(StateError::Unavailable) => deny(StatusCode::SERVICE_UNAVAILABLE, "STATE_UNAVAILABLE"),
-        // Opaque tunnels cannot enforce the per-request attribution and
-        // evidence requirements of invariant 4.
         Ok(()) if req.method() == Method::CONNECT => {
+            let inspection = transport
+                .workspace_root()
+                .filter(|_| transport.provisioned(id))
+                .and_then(|root| {
+                    let target = transport::target(req.uri().authority()?.as_str(), 443).ok()?;
+                    // CONNECT requires explicit authority form, including a port.
+                    if req.uri().scheme().is_some()
+                        || req.uri().path_and_query().is_some()
+                        || req.uri().authority()?.port_u16().is_none()
+                    {
+                        return None;
+                    }
+                    let mut hosts = req.headers().get_all(header::HOST).iter();
+                    let host = transport::target(hosts.next()?.to_str().ok()?, 443).ok()?;
+                    if hosts.next().is_some()
+                        || host.host != target.host
+                        || host.port != target.port
+                    {
+                        return None;
+                    }
+                    let ca = inspection::WorkspaceCa::load(root, id).ok()?;
+                    Some((target.clone(), ca.server_config(&target.host).ok()?))
+                });
+            if let Some((target, config)) = inspection {
+                let Some(session_permit) = transport.try_tls_permit() else {
+                    return deny(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "INSPECTION_CAPACITY_UNAVAILABLE",
+                    );
+                };
+                let upgrade = hyper::upgrade::on(&mut req);
+                let transport = transport.clone();
+                let breaker = breaker.clone();
+                let policy = policy.clone();
+                tokio::spawn(async move {
+                    let _session_permit = session_permit;
+                    let upgraded = tokio::select! {
+                        biased;
+                        () = breaker.wait_blocked(id) => return,
+                        result = tokio::time::timeout(Duration::from_secs(5), upgrade) => match result { Ok(Ok(upgraded)) => upgraded, _ => return },
+                    };
+                    let ingress = tokio::select! {
+                        biased;
+                        () = breaker.wait_blocked(id) => return,
+                        result = tls::classify_ingress(TokioIo::new(upgraded), id, Uuid::new_v4(), Duration::from_millis(250), transport.evidence().expect("configured evidence"), &policy) => result,
+                    };
+                    if let tls::Ingress::Candidate { prefix, client } = ingress {
+                        tokio::select! {
+                            biased;
+                            () = breaker.wait_blocked(id) => (),
+                            _ = inspection::serve(client, prefix, config, id, target, transport) => (),
+                        }
+                    }
+                });
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Full::new(Bytes::new()))
+                    .expect("CONNECT response");
+            }
             let reason = tls::RejectionReason::OpaqueTunnelNotAllowed;
             let event_id = Uuid::new_v4();
             let payload =
                 serde_json::json!({"reason":reason, "phase":"before_200", "prefix_hex":""});
             let policy = policy.clone();
-            // A stop must interrupt the client response even when the ledger
-            // is slow. The append can still finish under its idempotency key.
             let append = tokio::spawn(async move {
                 if let Err(error) = policy
                     .audit_event(id, event_id, "TUNNEL_REJECTED", payload)
@@ -92,9 +157,7 @@ async fn handle(req: Request<Incoming>, policy: &PolicyClient, breaker: &Breaker
                 _ = append => deny(StatusCode::FORBIDDEN, reason),
             }
         }
-        // The listener has no origin transport. Reserving at this point
-        // would consume a worker with no final origin status to report.
-        Ok(()) => deny(StatusCode::NOT_IMPLEMENTED, "FORWARDING_UNAVAILABLE"),
+        Ok(()) => transport.forward_traced(req, id, None, timing).await,
     }
 }
 
@@ -108,6 +171,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .parse()?;
     let listener = TcpListener::bind(listen).await?;
     let breaker = Breaker::default();
+    let transport =
+        transport::Transport::from_environment(policy.clone(), breaker.clone(), redis.clone())?;
     let subscriber = breaker.clone();
     tokio::spawn(async move {
         if subscriber.listen(redis).await.is_err() {
@@ -123,17 +188,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => return Err(err.into()),
         };
+        stream.set_nodelay(true)?;
         let policy = policy.clone();
         let breaker = breaker.clone();
+        let transport = transport.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let service = service_fn(|req| async {
-                Ok::<_, Infallible>(handle(req, &policy, &breaker).await)
+                Ok::<_, Infallible>(handle(req, &policy, &breaker, &transport).await)
             });
             let _ = http1::Builder::new()
                 .timer(TokioTimer::new())
                 .header_read_timeout(Duration::from_secs(5))
                 .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades()
                 .await;
         });
     }

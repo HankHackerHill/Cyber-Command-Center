@@ -6,9 +6,10 @@
 //! Run `cargo test --release --test load -- --ignored --nocapture`.
 //!
 //! Four closed-loop workers alternate the order of direct/proxied transactions.
-//! Each measurement includes consumption of the entire body. After 64 warm-up
-//! pairs, compute the nearest-rank p99 of 1,000 signed, paired latency deltas in
-//! each of three runs. The median of the three p99 values must be below 15 ms.
+//! Each measurement includes consumption of the entire body. Report the
+//! nearest-rank p99 of 64 warm-up signed, paired latency deltas, then 1,000
+//! deltas in each of three measured runs. Only the median of the three measured
+//! p99 values is subject to the below-15-ms acceptance gate.
 
 use std::{
     collections::hash_map::RandomState,
@@ -103,6 +104,7 @@ impl Benchmark {
             Client::builder()
                 .no_proxy()
                 .redirect(Policy::none())
+                .retry(reqwest::retry::never())
                 .timeout(Duration::from_secs(3))
         };
         Ok(Self {
@@ -204,11 +206,12 @@ fn median_uses_the_middle_run_p99_value() {
 #[ignore = "requires a provisioned, running M4 proxy on loopback"]
 async fn proxied_http_overhead_p99_under_15ms() -> Result<(), Failure> {
     let benchmark = Benchmark::set_up().await?;
-    benchmark
+    let mut warmup_deltas = benchmark
         .pairs(0, WARMUP)
         .await
         .map_err(|err| format!("warm-up failed before any measured run: {err}"))?;
-    println!("Warm-up completed ({WARMUP} pairs, concurrency {CONCURRENCY}).");
+    let warmup_p99_ms = nearest_rank_p99(&mut warmup_deltas) as f64 / 1_000_000.0;
+    println!("Warm-up p99 {warmup_p99_ms:.6} ms ({WARMUP} pairs, concurrency {CONCURRENCY}).");
     let mut p99_values = [0; 3];
     for (index, value) in p99_values.iter_mut().enumerate() {
         let run = index + 1;

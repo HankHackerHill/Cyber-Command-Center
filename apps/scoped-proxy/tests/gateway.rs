@@ -152,12 +152,7 @@ async fn enforces_state_at_the_listener_before_any_reservation_or_target_connect
             ("INIT_SCOPING", false, 412, "PRECONDITION_FAILED"),
             ("HALTED_KILLSWITCH", false, 412, "PRECONDITION_FAILED"),
             ("COMPLETED_ARCHIVED", true, 412, "PRECONDITION_FAILED"),
-            (
-                "CONTROLLED_VALIDATION",
-                false,
-                501,
-                "FORWARDING_UNAVAILABLE",
-            ),
+            ("CONTROLLED_VALIDATION", false, 503, "MANIFEST_UNAVAILABLE"),
             (
                 "CONTROLLED_VALIDATION",
                 true,
