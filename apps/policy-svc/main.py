@@ -8,17 +8,21 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import TypedDict
 from uuid import UUID, uuid4
 
 import httpx
 from contracts.events import EngagementState
 from contracts.roe import ExecutionMode, RoeManifest
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -26,6 +30,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from redis import Redis
 from redis.exceptions import RedisError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from settlements import (
+    Completion, ConflictingCompletion, SettlementAcknowledgement, SettlementBatch, SettlementResponse,
+)
 
 
 class HttpRequest(BaseModel):
@@ -204,6 +212,87 @@ class AccountStore:
             return False
         return False
 
+    def complete_many(self, engagement_id: str, completions: list[Completion]) -> list[SettlementAcknowledgement]:
+        """Atomically consume distinct receipts and retain durable retry proofs.
+
+        No worker is released before the entire CAS commits. A matching retry is
+        acknowledged only by its persisted original status; missing receipts are
+        never evidence of completion. Retain the :settled hash with the live
+        accounting hash, including in backup/restore and engagement archival.
+        """
+        batch = SettlementBatch(engagement_id=engagement_id, completions=completions)
+        key = self._key(batch.engagement_id)
+        receipt_ids = [item.reservation_id for item in batch.completions]
+        for _ in range(12):
+            # A single snapshot covers bucket integrity, outstanding receipts,
+            # and durable completion fingerprints. Neither hash has an expiry.
+            snapshot: object = self.redis.eval(
+                "local a = redis.call('HMGET', KEYS[1], unpack(ARGV)) "
+                "local b = redis.call('HMGET', KEYS[2], unpack(ARGV)) "
+                "return {redis.call('HGET', KEYS[1], 'state'), "
+                "redis.call('HLEN', KEYS[1])-1, a, b}",
+                2, key, key + ":settled", *receipt_ids,
+            )
+            if not isinstance(snapshot, list) or len(snapshot) != 4:
+                raise InvalidInput("invalid settlement snapshot")
+            raw, count, outstanding, settled = snapshot
+            if not isinstance(raw, (str, bytes)) or not isinstance(outstanding, list) or not isinstance(settled, list):
+                raise InvalidInput("invalid settlement snapshot")
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            strict_json(raw.encode("utf-8"))
+            bucket = Bucket.model_validate_json(raw)
+            if (type(count) is not int or count != bucket.active_workers
+                    or bucket.credit > bucket.rate * 1_000_000
+                    or (bucket.rate == 0 and (bucket.at_us or bucket.active_workers or bucket.errors_5xx))
+                    or len(outstanding) != len(receipt_ids) or len(settled) != len(receipt_ids)):
+                raise InvalidInput("invalid settlement accounting")
+            consumed = 0
+            errors = 0
+            acknowledgements: list[SettlementAcknowledgement] = []
+            arguments: list[str] = []
+            for item, pending, prior in zip(batch.completions, outstanding, settled, strict=True):
+                if isinstance(pending, bytes):
+                    pending = pending.decode("ascii")
+                if isinstance(prior, bytes):
+                    prior = prior.decode("ascii")
+                if pending not in (None, "1") or (prior is not None and (not isinstance(prior, str) or not re.fullmatch(r"[2-5][0-9]{2}", prior))):
+                    raise InvalidInput("invalid settlement receipt")
+                if pending is not None and prior is not None:
+                    raise InvalidInput("receipt outstanding and settled")
+                if prior is not None and prior != str(item.status_code):
+                    raise ConflictingCompletion("receipt status conflict")
+                if pending is not None:
+                    consumed += 1
+                    errors += int(item.status_code >= 500)
+                acknowledgements.append(SettlementAcknowledgement(
+                    reservation_id=item.reservation_id,
+                    status="committed" if pending is not None or prior is not None else "missing",
+                ))
+                arguments.extend([item.reservation_id, str(item.status_code), pending or "", prior or ""])
+            if consumed > bucket.active_workers:
+                raise InvalidInput("invalid settlement workers")
+            updated = bucket.model_copy(update={
+                "active_workers": bucket.active_workers - consumed,
+                "errors_5xx": bucket.errors_5xx + errors,
+            })
+            outcome: object = self.redis.eval(
+                "if redis.call('HGET', KEYS[1], 'state') ~= ARGV[1] then return 'retry' end "
+                "for i=3,#ARGV,4 do "
+                "if (redis.call('HGET', KEYS[1], ARGV[i]) or '') ~= ARGV[i+2] "
+                "or (redis.call('HGET', KEYS[2], ARGV[i]) or '') ~= ARGV[i+3] then return 'retry' end end "
+                "for i=3,#ARGV,4 do if ARGV[i+2] == '1' then "
+                "redis.call('HDEL', KEYS[1], ARGV[i]) "
+                "redis.call('HSET', KEYS[2], ARGV[i], ARGV[i+1]) end end "
+                "redis.call('HSET', KEYS[1], 'state', ARGV[2]) return 'ok'",
+                2, key, key + ":settled", raw, updated.model_dump_json(), *arguments,
+            )
+            if outcome in ("ok", b"ok"):
+                return acknowledgements
+            if outcome not in ("retry", b"retry"):
+                raise InvalidInput("invalid settlement response")
+        raise InvalidInput("settlement accounting busy")
+
 
 def unique_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
     fields = dict(pairs)
@@ -226,16 +315,88 @@ async def validate_wire(request: Request) -> None:
     strict_json(await request.body())
 
 
+class DecisionCache:
+    """Bounded manifest-validation and scope-denial cache, never allow authority.
+
+    Scope denials expire after one second: a policy hot reload can temporarily
+    over-deny, but cannot grant traffic. There is no cached allow, UTC window,
+    state, runtime snapshot, dependency error or reservation.
+    """
+
+    def __init__(self) -> None:
+        self.lock = Lock()
+        self.manifests: OrderedDict[str, tuple[RoeManifest, dict[str, object]]] = OrderedDict()
+        self.denials: OrderedDict[tuple[str, str, str, str, str, str], float] = OrderedDict()
+
+    def invalidate(self, digest: str) -> None:
+        with self.lock:
+            self.manifests.pop(digest, None)
+            for key in list(self.denials):
+                if key[0] == digest:
+                    del self.denials[key]
+
+    def read_manifest(self, directory: Path, digest: str) -> tuple[RoeManifest, dict[str, object]]:
+        # A stat/mtime cache cannot detect same-size replacement or revocation.
+        # Always read and SHA256 the actual registry bytes, even on a hit.
+        try:
+            raw = (directory / f"{digest}.json").read_bytes()
+            if hashlib.sha256(raw).hexdigest() != digest:
+                raise InvalidInput("manifest content hash mismatch")
+        except (OSError, InvalidInput):
+            self.invalidate(digest)
+            raise
+        with self.lock:
+            cached = self.manifests.get(digest)
+            if cached is not None:
+                self.manifests.move_to_end(digest)
+                return cached
+        value = parse_manifest(raw)
+        with self.lock:
+            self.manifests[digest] = value
+            self.manifests.move_to_end(digest)
+            while len(self.manifests) > 128:
+                self.manifests.popitem(last=False)
+        return value
+
+    @staticmethod
+    def key(digest: str, request: HttpRequest) -> tuple[str, str, str, str, str, str]:
+        return digest, request.method, request.host, request.ip, request.path, request.ts
+
+    def scope_denied(self, digest: str, request: HttpRequest) -> bool:
+        key = self.key(digest, request)
+        with self.lock:
+            expiry = self.denials.get(key)
+            if expiry is None:
+                return False
+            if time.monotonic() >= expiry:
+                del self.denials[key]
+                return False
+            self.denials.move_to_end(key)
+            return True
+
+    def remember(self, digest: str, request: HttpRequest, decision: Decision) -> None:
+        if decision.allow or decision.reason != "SCOPE_DENIED":
+            return
+        with self.lock:
+            self.denials[self.key(digest, request)] = time.monotonic() + 1.0
+            self.denials.move_to_end(self.key(digest, request))
+            while len(self.denials) > 2048:
+                self.denials.popitem(last=False)
+
+
+def parse_manifest(raw: bytes) -> tuple[RoeManifest, dict[str, object]]:
+    document = strict_json(raw)
+    if not isinstance(document, dict):
+        raise InvalidInput("invalid manifest")
+    # Keep original timestamp strings: Python datetime truncates nanoseconds.
+    return RoeManifest.model_validate_json(raw, strict=True), document
+
+
 def read_manifest(directory: Path, digest: str) -> tuple[RoeManifest, dict[str, object]]:
     raw = (directory / f"{digest}.json").read_bytes()
     if hashlib.sha256(raw).hexdigest() != digest:
         raise InvalidInput("manifest content hash mismatch")
-    document = strict_json(raw)
-    if not isinstance(document, dict):
-        raise InvalidInput("invalid manifest")
-    # The contract validates the document. OPA uses its original timestamp
-    # strings so a nanosecond boundary cannot be widened by Python datetime.
-    return RoeManifest.model_validate_json(raw, strict=True), document
+    return parse_manifest(raw)
 
 
 def check_rules(opa: httpx.Client, manifest: dict[str, object], request: HttpRequest,
@@ -301,6 +462,7 @@ def create_app(
             app.state.orchestrator = orchestrator
             app.state.opa = opa
             app.state.accounting = AccountStore(redis, time_us=time_us)
+            app.state.decision_cache = DecisionCache()
             yield
 
     app = FastAPI(lifespan=lifespan)
@@ -314,7 +476,30 @@ def create_app(
     @app.exception_handler(RequestValidationError)
     @app.exception_handler(InvalidInput)
     async def invalid(request: Request, exc: Exception) -> JSONResponse:
+        if request.url.path == "/settlements":
+            return JSONResponse(status_code=422, content={"detail": "INVALID_SETTLEMENT"})
         return JSONResponse(content=Decision(reason="INVALID_REQUEST").model_dump())
+
+    def authenticate_observer(request: Request) -> None:
+        token = os.environ.get("M4_AUDIT_TOKEN")
+        if not token:
+            raise HTTPException(status_code=503, detail="SETTLEMENT_AUTH_UNAVAILABLE")
+        supplied = request.headers.getlist("authorization")
+        if len(supplied) != 1 or not secrets.compare_digest(
+            supplied[0].encode("utf-8"), ("Bearer " + token).encode("utf-8"),
+        ):
+            raise HTTPException(status_code=401, detail="UNAUTHORIZED")
+
+    @app.post("/settlements", dependencies=[Depends(authenticate_observer), Depends(validate_wire)])
+    def settle(batch: SettlementBatch, request: Request) -> SettlementResponse:
+        store: AccountStore = request.app.state.accounting
+        try:
+            results = store.complete_many(batch.engagement_id, batch.completions)
+        except ConflictingCompletion as exc:
+            raise HTTPException(status_code=409, detail="COMPLETION_CONFLICT") from exc
+        except (RedisError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail="ACCOUNTING_UNAVAILABLE") from exc
+        return SettlementResponse(engagement_id=batch.engagement_id, completions=results)
 
     @app.post(
         "/evaluate",
@@ -331,7 +516,8 @@ def create_app(
         """
         services = request.app.state
         try:
-            manifest, document = read_manifest(services.directory, evaluation.manifest_hash)
+            cache: DecisionCache = services.decision_cache
+            manifest, document = cache.read_manifest(services.directory, evaluation.manifest_hash)
         except FileNotFoundError:
             return Decision(reason="UNKNOWN_MANIFEST")
         except (OSError, InvalidInput, ValidationError):
@@ -343,7 +529,14 @@ def create_app(
             denied = check_state(services.orchestrator, manifest.engagement_id)
             if denied is not None:
                 return denied
-            return check_rules(services.opa, document, evaluation.request, utc_now(), runtime)
+            now = utc_now()
+            if now.utcoffset() is None:
+                return Decision(reason="CLOCK_UNAVAILABLE")
+            if cache.scope_denied(evaluation.manifest_hash, evaluation.request):
+                return Decision(reason="SCOPE_DENIED")
+            decision = check_rules(services.opa, document, evaluation.request, now, runtime)
+            cache.remember(evaluation.manifest_hash, evaluation.request, decision)
+            return decision
 
         store: AccountStore = services.accounting
         try:
