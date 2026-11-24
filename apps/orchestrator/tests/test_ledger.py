@@ -61,6 +61,7 @@ def test_stop_extends_existing_tail(connection: psycopg.Connection) -> None:
     prior, stop = read_ledger(connection, engagement_id, 0)
     assert prior.record_hash == previous == stop.prev_record_hash
     assert stop.record_hash == digest == hash_record(previous, stop.event)
+    assert isinstance(stop.event, TransitionEvent)
     assert stop.event.from_state == EngagementState.REMEDIATION_SYNTHESIS
 
 

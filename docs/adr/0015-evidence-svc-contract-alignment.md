@@ -1,0 +1,2 @@
+# ADR-0015: Evidence-Svc Contract Alignment
+**Status:** Accepted. evidence-svc implements the artifact API that apps/scoped-proxy/src/evidence_client.rs already calls. The Rust client is the reference consumer; the Python service must match its request/response shapes exactly. Any discovered mismatch is resolved on the service side unless it requires a contract change, which goes through the ADR process.
