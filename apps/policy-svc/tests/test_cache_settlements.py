@@ -1,10 +1,12 @@
 """Conservative cache proof and atomic, retry-safe trusted settlement protocol."""
 
+import hashlib
+import json
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from threading import Barrier
+from threading import Barrier, Event, Lock
 from typing import cast
 from uuid import uuid4
 
@@ -444,3 +446,252 @@ def test_malformed_atomic_clock_denies_endpoint_without_releasing_workers(sandbo
         assert response.status_code == 200
         assert response.json() == {"allow": False, "reason": "ACCOUNTING_UNAVAILABLE"}
         assert sandbox.store._read(sandbox.store._key(engagement))[1].active_workers == 0
+
+
+def test_fresh_authority_overlaps_judge_but_precedes_reservation_commit(sandbox: Sandbox) -> None:
+    engagement, _ = sandbox.provision()
+    started = Event()
+    judged = Event()
+    release = Event()
+
+    def state() -> Decision | None:
+        started.set()
+        assert release.wait(5)
+        return None
+
+    def judge(_: main.Runtime) -> Decision:
+        assert started.wait(5)
+        judged.set()
+        return Decision(allow=True, reason="ALLOWED")
+
+    with ThreadPoolExecutor(max_workers=1) as authority_executor, ThreadPoolExecutor(max_workers=1) as requests:
+        authority = main.AuthorityChecks(authority_executor, workers=1)
+        future = requests.submit(sandbox.store.reserve, engagement, 2, judge, authority=authority, state_check=state)
+        try:
+            assert judged.wait(5)  # Policy runs while fresh M2 is still pending.
+            assert not future.done()
+            assert sandbox.store._read(sandbox.store._key(engagement))[1].active_workers == 0
+        finally:
+            release.set()
+        result, receipt = future.result(timeout=5)
+        assert result.allow and receipt is not None
+        assert sandbox.store.complete(engagement, receipt, 200)
+
+
+@pytest.mark.parametrize("policy_reason", ["ALLOWED", "WINDOW_DENIED", "POLICY_UNAVAILABLE"])
+def test_authority_denial_keeps_priority_over_overlapped_policy(sandbox: Sandbox, policy_reason: str) -> None:
+    engagement, _ = sandbox.provision()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        authority = main.AuthorityChecks(executor, workers=1)
+        result, receipt = sandbox.store.reserve(
+            engagement, 2, lambda _: Decision(allow=policy_reason == "ALLOWED", reason=policy_reason),
+            authority=authority, state_check=lambda: Decision(reason="STATE_DENIED"),
+        )
+    assert result == Decision(reason="STATE_DENIED") and receipt is None
+    assert sandbox.store._read(sandbox.store._key(engagement))[1].active_workers == 0
+
+
+def test_authority_exception_fails_closed(sandbox: Sandbox) -> None:
+    engagement, _ = sandbox.provision()
+
+    def unavailable() -> Decision | None:
+        raise RuntimeError("test-only authority task failure")
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result, receipt = sandbox.store.reserve(
+            engagement, 2, lambda _: Decision(allow=True, reason="ALLOWED"),
+            authority=main.AuthorityChecks(executor, workers=1), state_check=unavailable,
+        )
+    assert result == Decision(reason="STATE_UNAVAILABLE") and receipt is None
+    assert sandbox.store._read(sandbox.store._key(engagement))[1].active_workers == 0
+
+
+def test_every_cas_retry_rechecks_authority_and_halt_cannot_commit(sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    engagement, _ = sandbox.provision()
+    states = 0
+    judgements = 0
+    writes = 0
+
+    def state() -> Decision | None:
+        nonlocal states
+        states += 1
+        return None if states == 1 else Decision(reason="STATE_DENIED")
+
+    def judge(_: main.Runtime) -> Decision:
+        nonlocal judgements
+        judgements += 1
+        return Decision(allow=True, reason="ALLOWED")
+
+    def retry(script: str, key: str, *arguments: str) -> str:
+        nonlocal writes
+        writes += 1
+        return "retry"
+
+    monkeypatch.setattr(sandbox.store, "_update", retry)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result, receipt = sandbox.store.reserve(
+            engagement, 2, judge, authority=main.AuthorityChecks(executor, workers=1), state_check=state,
+        )
+    assert result == Decision(reason="STATE_DENIED") and receipt is None
+    assert states == 2 and judgements == 2 and writes == 1
+    assert sandbox.store._read(sandbox.store._key(engagement))[1].active_workers == 0
+
+
+def test_policy_failure_drains_pending_authority_before_return(sandbox: Sandbox) -> None:
+    engagement, _ = sandbox.provision()
+    started = Event()
+    failed = Event()
+    release = Event()
+    completed = Event()
+
+    def state() -> Decision | None:
+        started.set()
+        assert release.wait(5)
+        completed.set()
+        return None
+
+    def unavailable(runtime: main.Runtime) -> Decision:
+        assert started.wait(5)
+        failed.set()
+        raise main.InvalidInput("test-only broken policy query")
+    with ThreadPoolExecutor(max_workers=1) as executor, ThreadPoolExecutor(max_workers=1) as requests:
+        future = requests.submit(
+            sandbox.store.reserve, engagement, 2, unavailable,
+            authority=main.AuthorityChecks(executor, workers=1), state_check=state,
+        )
+        try:
+            assert failed.wait(5)
+            assert not future.done() and not completed.is_set()
+        finally:
+            release.set()
+        with pytest.raises(main.InvalidInput):
+            future.result(timeout=5)
+        assert completed.is_set()
+
+
+def test_authority_pool_bounds_jobs_and_releases_slots() -> None:
+    release = Event()
+    both_started = Event()
+    lock = Lock()
+    active = 0
+    maximum = 0
+
+    def state() -> Decision | None:
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+            if active == 2:
+                both_started.set()
+        try:
+            assert release.wait(5)
+            return None
+        finally:
+            with lock:
+                active -= 1
+
+    with ThreadPoolExecutor(max_workers=4) as executor, ThreadPoolExecutor(max_workers=6) as requests:
+        authority = main.AuthorityChecks(executor, workers=2)
+
+        def check() -> Decision | None:
+            with authority.pending(state) as future:
+                return future.result()
+
+        futures = [requests.submit(check) for _ in range(6)]
+        try:
+            assert both_started.wait(5)
+            with lock:
+                assert active == 2
+        finally:
+            release.set()
+        assert [future.result(timeout=5) for future in futures] == [None] * 6
+    assert maximum == 2 and active == 0
+
+
+def test_closed_authority_executor_fails_closed_and_releases_slot() -> None:
+    executor = ThreadPoolExecutor(max_workers=1)
+    authority = main.AuthorityChecks(executor, workers=1)
+    executor.shutdown(wait=True)
+    for _ in range(2):
+        with pytest.raises(main.InvalidInput):
+            with authority.pending(lambda: None):
+                pytest.fail("closed executor must never yield an admission proof")
+
+
+def test_invalid_accounting_and_backwards_clock_precede_authority_launch(sandbox: Sandbox) -> None:
+    engagement, _ = sandbox.provision()
+    key = sandbox.store._key(engagement)
+    states = 0
+
+    def state() -> Decision | None:
+        nonlocal states
+        states += 1
+        return Decision(reason="STATE_DENIED")
+
+    store = main.AccountStore(sandbox.store.redis, time_us=lambda: 9)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        authority = main.AuthorityChecks(executor, workers=1)
+        sandbox.store.redis.hset(key, "state", "{}")
+        with pytest.raises(ValueError):
+            store.reserve(engagement, 2, lambda _: Decision(allow=True, reason="ALLOWED"), authority=authority, state_check=state)
+        sandbox.store.redis.hset(key, "state", main.Bucket(credit=0, at_us=10, rate=2, active_workers=0, errors_5xx=0).model_dump_json())
+        result, receipt = store.reserve(
+            engagement, 2, lambda _: Decision(allow=True, reason="ALLOWED"), authority=authority, state_check=state,
+        )
+        assert result == Decision(reason="CLOCK_UNAVAILABLE") and receipt is None
+    assert states == 0
+
+
+@pytest.mark.parametrize(("initial", "joined", "end", "expected", "reason", "checks"), [
+    ("2026-12-01T12:00:00+00:00", "2026-12-01T12:00:00.001000+00:00", "2026-12-10T08:00:00Z", True, "ALLOWED", 1),
+    ("2026-12-10T07:59:59.999999+00:00", "2026-12-10T08:00:00+00:00", "2026-12-10T08:00:00Z", False, "WINDOW_DENIED", 2),
+    ("2026-12-04T23:59:59.999999+00:00", "2026-12-05T00:00:00+00:00", "2026-12-10T08:00:00Z", False, "WINDOW_DENIED", 2),
+    ("2026-12-01T12:00:00+00:00", "2026-12-01T07:59:59.999999+00:00", "2026-12-10T08:00:00Z", False, "WINDOW_DENIED", 2),
+    ("2026-12-01T12:00:00+00:00", "2026-12-01T11:59:59+00:00", "2026-12-10T08:00:00Z", True, "ALLOWED", 2),
+    ("2026-12-01T11:59:59.999999+00:00", "2026-12-01T12:00:00+00:00", "2026-12-01T12:00:00.000000500Z", True, "ALLOWED", 2),
+    ("2026-12-01T11:59:59.999999+00:00", "2026-12-01T12:00:00.000001+00:00", "2026-12-01T12:00:00.000000500Z", False, "WINDOW_DENIED", 2),
+    ("2026-12-01T12:00:00+00:00", "2026-12-01T12:00:00", "2026-12-10T08:00:00Z", False, "CLOCK_UNAVAILABLE", 2),
+    ("2026-12-01T14:00:00+02:00", "2026-12-01T07:00:00-05:00", "2026-12-10T08:00:00Z", True, "ALLOWED", 1),
+])
+def test_slow_authority_join_preserves_fresh_opa_window(
+    sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch, initial: str, joined: str,
+    end: str, expected: bool, reason: str, checks: int,
+) -> None:
+    engagement, digest = sandbox.provision()
+    document = json.loads((sandbox.directory / f"{digest}.json").read_bytes())
+    document["valid_window"]["not_after"] = end
+    raw = json.dumps(document).encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    (sandbox.directory / f"{digest}.json").write_bytes(raw)
+    now = datetime.fromisoformat(initial)
+    first_policy_done = Event()
+    original = main.check_rules
+    samples: list[datetime] = []
+
+    def rules(opa: httpx.Client, manifest: dict[str, object], request: HttpRequest,
+              at: datetime, runtime: main.Runtime) -> Decision:
+        samples.append(at)
+        result = original(opa, manifest, request, at, runtime)
+        if len(samples) == 1:
+            assert result.allow
+            first_policy_done.set()
+        return result
+
+    def state(_: httpx.Request) -> httpx.Response:
+        nonlocal now
+        assert first_policy_done.wait(5)
+        now = datetime.fromisoformat(joined)
+        return httpx.Response(200, json={"state": "CONTROLLED_VALIDATION"})
+
+    monkeypatch.setattr(main, "check_rules", rules)
+    app = create_app(manifest_dir=sandbox.directory, orchestrator_url="http://m2.invalid", opa_url=sandbox.opa,
+                     redis_url=sandbox.redis_url, clock=lambda: now, transport=httpx.MockTransport(state))
+    with TestClient(app) as client:
+        response = client.post("/evaluate", json=envelope(digest))
+        decision(response, expected)
+        assert response.json()["reason"] == reason
+        assert len(samples) == checks
+        if expected:
+            assert sandbox.store.complete(engagement, response.headers[HEADER], 200)
+        else:
+            assert sandbox.store._read(sandbox.store._key(engagement))[1].active_workers == 0
