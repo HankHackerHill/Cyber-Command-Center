@@ -73,16 +73,35 @@ class AuditOutbox:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         os.close(descriptor)
-        with self.connect() as conn:
-            mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        # Keep one idle WAL connection for this outbox's lifetime. Closing the
+        # final connection otherwise checkpoints WAL on every operation, adding
+        # avoidable filesystem syncs beside the proxy's durable request spool.
+        # Only construction and close use this connection; request/worker threads
+        # keep their own connections and every writer still uses FULL durability.
+        self._anchor: sqlite3.Connection | None = sqlite3.connect(
+            self.path, timeout=0.25, check_same_thread=False,
+        )
+        try:
+            self._anchor.execute("PRAGMA synchronous=FULL")
+            mode = self._anchor.execute("PRAGMA journal_mode=WAL").fetchone()
             if mode != ("wal",):
                 raise RuntimeError("Audit outbox requires SQLite WAL")
-            conn.execute("""CREATE TABLE IF NOT EXISTS audit_jobs (
-                engagement_id TEXT NOT NULL, event_id TEXT NOT NULL, body TEXT NOT NULL,
-                receipt TEXT, attempts INTEGER NOT NULL DEFAULT 0,
-                next_attempt REAL NOT NULL DEFAULT 0, last_error TEXT,
-                PRIMARY KEY (engagement_id, event_id))""")
-            conn.execute("CREATE INDEX IF NOT EXISTS audit_jobs_pending ON audit_jobs(next_attempt) WHERE receipt IS NULL")
+            with self._anchor:
+                self._anchor.execute("""CREATE TABLE IF NOT EXISTS audit_jobs (
+                    engagement_id TEXT NOT NULL, event_id TEXT NOT NULL, body TEXT NOT NULL,
+                    receipt TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt REAL NOT NULL DEFAULT 0, last_error TEXT,
+                    PRIMARY KEY (engagement_id, event_id))""")
+                self._anchor.execute("CREATE INDEX IF NOT EXISTS audit_jobs_pending ON audit_jobs(next_attempt) WHERE receipt IS NULL")
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Release the idle WAL anchor after delivery has stopped."""
+        if self._anchor is not None:
+            self._anchor.close()
+            self._anchor = None
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:

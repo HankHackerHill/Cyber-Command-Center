@@ -277,3 +277,39 @@ def test_poll_known_pending_survives_database_outage(stalled: TestClient, urls: 
         response = stalled.get(f"{path}/{key}", headers=TOKEN)
         assert response.status_code == 202 and response.json() == queued.json()
         assert stalled.get(f"{path}/{uuid4()}", headers=TOKEN).status_code == 503
+
+
+def test_wal_anchor_avoids_per_operation_checkpoint_and_closes_cleanly(tmp_path: Path) -> None:
+    path = tmp_path / "anchored.sqlite3"
+    box = AuditOutbox(path)
+    eid, key = uuid4(), uuid4()
+    box.enqueue(eid, key, event(n=1))
+    wal = Path(f"{path}-wal")
+    assert wal.exists() and wal.stat().st_size > 0
+    # Each operation closes its private connection. The idle anchor retains WAL
+    # until explicit shutdown; synchronous=FULL still protects every enqueue.
+    assert isinstance(box.lookup(eid, key), QueuedAudit)
+    assert wal.exists() and wal.stat().st_size > 0
+    box.close()
+    box.close()
+    assert not wal.exists()
+    reopened = AuditOutbox(path)
+    try:
+        assert isinstance(reopened.lookup(eid, key), QueuedAudit)
+        with reopened.connect() as conn:
+            assert conn.execute("PRAGMA synchronous").fetchone() == (2,)
+    finally:
+        reopened.close()
+
+
+def test_lifespan_releases_wal_anchor(urls: tuple[str, str], tmp_path: Path,
+                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(AuditDelivery, "start", lambda self: None)
+    monkeypatch.setattr(AuditDelivery, "stop", lambda self: None)
+    path = tmp_path / "lifespan.sqlite3"
+    app = create_app(database_url=urls[0], redis_url=urls[1], m4_audit_token="test-m4", audit_outbox_path=str(path))
+    with TestClient(app):
+        box: AuditOutbox = app.state.audit_outbox
+        box.enqueue(uuid4(), uuid4(), event())
+        assert Path(f"{path}-wal").exists()
+    assert not Path(f"{path}-wal").exists()

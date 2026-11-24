@@ -116,8 +116,12 @@ def create_app(
             try:
                 yield
             finally:
-                if delivery is not None:
-                    delivery.stop()
+                try:
+                    if delivery is not None:
+                        delivery.stop()
+                finally:
+                    if outbox is not None:
+                        outbox.close()
 
     app = FastAPI(lifespan=lifespan)
 

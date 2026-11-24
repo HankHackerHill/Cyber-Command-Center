@@ -63,13 +63,15 @@ backed up, restored and archived together; durable Redis configuration remains
 an operational prerequisite. The legacy `complete` interface retains its
 existing duplicate-false behavior.
 
-M4 must submit final 5xx statuses immediately and block initiation of later
-evaluations until their shared count commits; evaluations already started under
+On observing a final 5xx, M4 immediately raises its admission barrier and
+records the local consecutive breaker once. It durably captures the final
+result before submitting settlement, and blocks initiation of later evaluations
+until the shared cumulative count commits. Evaluations already started under
 its fair accounting gate retain their original in-flight ordering and worker
-reservation. It must not defer 5xx counting with successful-response batches. Its local consecutive
-breaker records each actual origin result once, independently of delivery
-retries. Until settlement commits, worker slots remain held. Batching is not a
-new cross-replica ordering guarantee for M4's consecutive breaker.
+reservation. Final 5xx settlement does not wait for successful-response batches;
+delivery retries do not increment the local breaker again. Until settlement
+commits, worker slots remain held. Batching is not a new cross-replica ordering
+guarantee for M4's consecutive breaker.
 
 ## Verification
 
