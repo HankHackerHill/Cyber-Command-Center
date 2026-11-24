@@ -1,4 +1,5 @@
 pub mod breaker;
+pub mod delivery;
 pub mod evidence_client;
 pub mod inspection;
 pub mod policy_client;
@@ -67,7 +68,7 @@ async fn handle(
     let state = tokio::select! {
         biased;
         () = breaker.wait_blocked(id) => return stop_response(breaker),
-        result = policy.check_state(id) => result,
+        result = transport::Timing::measure_work(&timing, policy.check_state(id)) => result,
     };
     transport::Timing::record(&timing, "state", phase_started);
     if breaker.blocked(id) {
@@ -79,6 +80,7 @@ async fn handle(
         }
         Err(StateError::Unavailable) => deny(StatusCode::SERVICE_UNAVAILABLE, "STATE_UNAVAILABLE"),
         Ok(()) if req.method() == Method::CONNECT => {
+            let setup_started = tokio::time::Instant::now();
             let inspection = transport
                 .workspace_root()
                 .filter(|_| transport.provisioned(id))
@@ -102,6 +104,11 @@ async fn handle(
                     let ca = inspection::WorkspaceCa::load(root, id).ok()?;
                     Some((target.clone(), ca.server_config(&target.host).ok()?))
                 });
+            let setup_ns = if timing.is_some() {
+                transport::Timing::processing_ns(&timing)
+            } else {
+                setup_started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+            };
             if let Some((target, config)) = inspection {
                 let Some(session_permit) = transport.try_tls_permit() else {
                     return deny(
@@ -110,7 +117,7 @@ async fn handle(
                     );
                 };
                 let upgrade = hyper::upgrade::on(&mut req);
-                let transport = transport.clone();
+                let transport = transport.with_tls_setup(setup_ns);
                 let breaker = breaker.clone();
                 let policy = policy.clone();
                 tokio::spawn(async move {
@@ -123,7 +130,7 @@ async fn handle(
                     let ingress = tokio::select! {
                         biased;
                         () = breaker.wait_blocked(id) => return,
-                        result = tls::classify_ingress(TokioIo::new(upgraded), id, Uuid::new_v4(), Duration::from_millis(250), transport.evidence().expect("configured evidence"), &policy) => result,
+                        result = transport.measure_tls_setup(tls::classify_ingress(TokioIo::new(upgraded), id, Uuid::new_v4(), Duration::from_millis(250), transport.evidence().expect("configured evidence"), &policy)) => result,
                     };
                     if let tls::Ingress::Candidate { prefix, client } = ingress {
                         tokio::select! {

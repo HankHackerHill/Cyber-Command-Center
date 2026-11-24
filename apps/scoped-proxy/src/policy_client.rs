@@ -159,6 +159,31 @@ impl PolicyClient {
         event_type: &str,
         payload: serde_json::Value,
     ) -> Result<String, AuditError> {
+        self.audit_event_inner(engagement_id, event_id, event_type, payload, false)
+            .await
+    }
+
+    /// A matching 202 proves M2's durable outbox accepted this exact immutable
+    /// event. Existing opaque rejection callers keep synchronous ledger proof.
+    pub async fn audit_event_durable(
+        &self,
+        engagement_id: Uuid,
+        event_id: Uuid,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> Result<String, AuditError> {
+        self.audit_event_inner(engagement_id, event_id, event_type, payload, true)
+            .await
+    }
+
+    async fn audit_event_inner(
+        &self,
+        engagement_id: Uuid,
+        event_id: Uuid,
+        event_type: &str,
+        payload: serde_json::Value,
+        asynchronous: bool,
+    ) -> Result<String, AuditError> {
         #[derive(Deserialize)]
         struct Receipt {
             seq_id: u64,
@@ -185,17 +210,38 @@ impl PolicyClient {
             "payload":payload,
         });
         for _ in 0..2 {
-            let response = self
+            let request = self
                 .http
                 .post(url.clone())
                 .header(reqwest::header::AUTHORIZATION, authorization.clone())
                 .header("Idempotency-Key", event_id.to_string())
-                .json(&body)
-                .send()
-                .await;
+                .json(&body);
+            let request = if asynchronous {
+                request.header("Prefer", "respond-async")
+            } else {
+                request
+            };
+            let response = request.send().await;
             let Ok(response) = response else { continue };
             if response.status().is_server_error() {
                 continue;
+            }
+            if asynchronous && response.status() == StatusCode::ACCEPTED {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Queued {
+                    status: String,
+                    event_id: Uuid,
+                    engagement_id: Uuid,
+                }
+                if let Some(queued) = read_json::<Queued>(response).await
+                    && queued.status == "queued"
+                    && queued.event_id == event_id
+                    && queued.engagement_id == engagement_id
+                {
+                    return Ok(event_id.to_string());
+                }
+                return Err(AuditError::Unconfirmed);
             }
             if !matches!(response.status(), StatusCode::OK | StatusCode::CREATED) {
                 return Err(AuditError::Rejected(response.status()));
@@ -222,6 +268,67 @@ impl PolicyClient {
             return Err(AuditError::Unconfirmed);
         }
         Err(AuditError::Unconfirmed)
+    }
+
+    /// M3 retains receipt/status fingerprints atomically with consumption;
+    /// matching retries are committed proof, missing receipts never are.
+    pub async fn settle_batch(
+        &self,
+        engagement_id: Uuid,
+        completions: &[(Uuid, u16)],
+    ) -> Result<std::collections::HashSet<Uuid>, AuditError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Batch {
+            engagement_id: Uuid,
+            completions: Vec<Completion>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Completion {
+            reservation_id: Uuid,
+            status: String,
+        }
+        let authorization = self
+            .audit_authorization
+            .as_ref()
+            .ok_or(AuditError::MissingCredential)?;
+        let mut url = self.policy.clone();
+        url.set_path("/settlements");
+        let body = serde_json::json!({"engagement_id":engagement_id,"completions":completions.iter().map(|(reservation_id,status_code)| serde_json::json!({"reservation_id":reservation_id,"status_code":status_code})).collect::<Vec<_>>()});
+        let response = self
+            .http
+            .post(url)
+            .header(reqwest::header::AUTHORIZATION, authorization.clone())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| AuditError::Unconfirmed)?;
+        if response.status() != StatusCode::OK {
+            return Err(AuditError::Rejected(response.status()));
+        }
+        let receipt: Batch = read_json(response).await.ok_or(AuditError::Unconfirmed)?;
+        if receipt.engagement_id != engagement_id || receipt.completions.len() != completions.len()
+        {
+            return Err(AuditError::Unconfirmed);
+        }
+        let expected: std::collections::HashSet<_> =
+            completions.iter().map(|(id, _)| *id).collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut committed = std::collections::HashSet::new();
+        for item in receipt.completions {
+            if !expected.contains(&item.reservation_id) || !seen.insert(item.reservation_id) {
+                return Err(AuditError::Unconfirmed);
+            }
+            match item.status.as_str() {
+                "committed" => {
+                    committed.insert(item.reservation_id);
+                }
+                "missing" => (),
+                _ => return Err(AuditError::Unconfirmed),
+            }
+        }
+        Ok(committed)
     }
 
     /// This checks invariant 3 only. M3 separately enforces active validation.

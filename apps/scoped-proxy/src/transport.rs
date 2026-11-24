@@ -38,6 +38,7 @@ use uuid::Uuid;
 use crate::{
     Reply,
     breaker::Breaker,
+    delivery::Outbox,
     deny,
     evidence_client::EvidenceClient,
     policy_client::{BoundManifest, EvaluationError, PolicyClient, PolicyRequest},
@@ -49,11 +50,16 @@ const MAX_HEADERS: usize = 64 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_MANIFEST: u64 = 1024 * 1024;
 
-/// Opt-in bounded phase diagnostics: timings and sample numbers only.
+/// Opt-in bounded diagnostics. Trace output contains timings and sample numbers;
+/// the trusted timing file additionally carries a path for sample correlation.
 #[derive(Clone)]
 pub struct Timing {
     sample: usize,
     started: Instant,
+    excluded_ns: Arc<std::sync::atomic::AtomicU64>,
+    work_ns: Arc<std::sync::atomic::AtomicU64>,
+    trace: bool,
+    setup_ns: u64,
 }
 impl Timing {
     pub fn start() -> Option<Self> {
@@ -63,26 +69,101 @@ impl Timing {
         };
         static ENABLED: OnceLock<bool> = OnceLock::new();
         static SAMPLES: AtomicUsize = AtomicUsize::new(0);
-        if !*ENABLED.get_or_init(|| env::var("SCOPED_PROXY_TRACE_TIMING").as_deref() == Ok("1")) {
+        let trace =
+            *ENABLED.get_or_init(|| env::var("SCOPED_PROXY_TRACE_TIMING").as_deref() == Ok("1"));
+        if !trace && env::var_os("SCOPED_PROXY_TIMING_PATH").is_none() {
             return None;
         }
         let sample = SAMPLES.fetch_add(1, Ordering::Relaxed);
-        (sample < 64).then(|| Self {
+        (sample < 20_000).then(|| Self {
             sample,
             started: Instant::now(),
+            excluded_ns: Arc::default(),
+            work_ns: Arc::default(),
+            trace,
+            setup_ns: 0,
         })
     }
     pub fn record(timing: &Option<Self>, phase: &str, started: Instant) {
         if let Some(timing) = timing {
-            eprintln!(
-                "{}",
-                json!({"event":"scoped_proxy_timing","sample":timing.sample,"phase":phase,"duration_us":started.elapsed().as_micros()})
-            );
+            let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            if matches!(
+                phase,
+                "state"
+                    | "admission_lock"
+                    | "evaluate"
+                    | "resolve"
+                    | "origin_status"
+                    | "body"
+                    | "evidence"
+                    | "audit"
+                    | "settlement_lock"
+                    | "settle"
+                    | "request_body"
+            ) {
+                timing
+                    .excluded_ns
+                    .fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+            }
+            if timing.trace && timing.sample < 64 {
+                eprintln!(
+                    "{}",
+                    json!({"event":"scoped_proxy_timing","sample":timing.sample,"phase":phase,"duration_us":started.elapsed().as_micros()})
+                );
+            }
         }
     }
-    fn finish(timing: &Option<Self>) {
+    pub fn processing_ns(timing: &Option<Self>) -> u64 {
+        timing.as_ref().map_or(0, |value| {
+            (value.started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                .saturating_sub(value.excluded_ns.load(std::sync::atomic::Ordering::Relaxed))
+                .saturating_add(value.work_ns.load(std::sync::atomic::Ordering::Relaxed))
+        })
+    }
+    /// Add back the active poll processing of a phase whose wall wait is
+    /// excluded, including serialization, response parsing and TLS crypto.
+    /// Time suspended waiting on network readiness is never added back.
+    pub async fn measure_work<F: std::future::Future>(
+        timing: &Option<Self>,
+        future: F,
+    ) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        futures_util::future::poll_fn(|cx| {
+            let started = Instant::now();
+            let result = future.as_mut().poll(cx);
+            if let Some(timing) = timing {
+                timing.work_ns.fetch_add(
+                    started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            result
+        })
+        .await
+    }
+    fn finish(timing: &Option<Self>, destination: &Destination) {
         if let Some(value) = timing {
             Self::record(timing, "total", value.started);
+            if let Some(path) = env::var_os("SCOPED_PROXY_TIMING_PATH") {
+                use std::io::Write;
+                let total_ns = (value.started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                    .saturating_add(value.setup_ns);
+                let excluded = value.excluded_ns.load(std::sync::atomic::Ordering::Relaxed);
+                let internal_ns = total_ns
+                    .saturating_sub(excluded)
+                    .saturating_add(value.work_ns.load(std::sync::atomic::Ordering::Relaxed));
+                let record = json!({"event":"scoped_proxy_internal","uri":destination.url.path(),"protocol":destination.url.scheme(),"internal_ns":internal_ns,"total_ns":total_ns,"tls_setup_ns":value.setup_ns});
+                let mut options = fs::OpenOptions::new();
+                options.create(true).append(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                if let Ok(mut file) = options.open(path) {
+                    let _ = writeln!(file, "{record}");
+                }
+            }
         }
     }
 }
@@ -99,7 +180,7 @@ struct Workspace {
     // M3 admission and observer completion both CAS the same account state.
     // Serialize only these short phases within this replica; origin/evidence
     // work retains its own reservation and remains concurrently bounded by M3.
-    accounting: tokio::sync::Mutex<()>,
+    accounting: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -108,9 +189,11 @@ pub struct Transport {
     breaker: Breaker,
     redis: redis::Client,
     evidence: Option<EvidenceClient>,
+    outbox: Option<Outbox>,
     workspaces: Arc<HashMap<Uuid, Workspace>>,
     root: Option<PathBuf>,
     tls_sessions: Arc<tokio::sync::Semaphore>,
+    tls_setup_ns: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 #[derive(Debug)]
@@ -188,7 +271,7 @@ impl Transport {
                     Ok::<_, &'static str>(Workspace {
                         manifest,
                         origin_roots,
-                        accounting: tokio::sync::Mutex::new(()),
+                        accounting: Arc::new(tokio::sync::Mutex::new(())),
                     })
                 })();
                 match loaded {
@@ -199,19 +282,56 @@ impl Transport {
                 }
             }
         }
+        let outbox = Outbox::from_environment()?;
+        if let Some(outbox) = &outbox {
+            outbox.start(
+                evidence.clone().ok_or("outbox requires evidence service")?,
+                policy.clone(),
+                workspaces
+                    .iter()
+                    .map(|(id, workspace)| (*id, workspace.accounting.clone()))
+                    .collect(),
+            );
+        }
         Ok(Self {
             policy,
             breaker,
             redis,
             evidence,
+            outbox,
             workspaces: Arc::new(workspaces),
             root,
             tls_sessions: Arc::new(tokio::sync::Semaphore::new(256)),
+            tls_setup_ns: None,
         })
     }
 
     pub fn try_tls_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         self.tls_sessions.clone().try_acquire_owned().ok()
+    }
+
+    /// A connection owns its CA/leaf setup cost. Charge that cost and TLS
+    /// handshake poll processing exactly once, to its first decrypted request.
+    pub fn with_tls_setup(&self, setup_ns: u64) -> Self {
+        let mut transport = self.clone();
+        transport.tls_setup_ns = Some(Arc::new(std::sync::atomic::AtomicU64::new(setup_ns)));
+        transport
+    }
+
+    pub async fn measure_tls_setup<F: std::future::Future>(&self, future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        futures_util::future::poll_fn(|cx| {
+            let started = Instant::now();
+            let result = future.as_mut().poll(cx);
+            if let Some(setup) = &self.tls_setup_ns {
+                setup.fetch_add(
+                    started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            result
+        })
+        .await
     }
 
     pub fn workspace_root(&self) -> Option<&Path> {
@@ -232,7 +352,13 @@ impl Transport {
         id: Uuid,
         tunnel: Option<TunnelTarget>,
     ) -> Reply {
-        self.forward_traced(req, id, tunnel, Timing::start()).await
+        let mut timing = Timing::start();
+        if let Some(timing) = &mut timing
+            && let Some(setup) = &self.tls_setup_ns
+        {
+            timing.setup_ns = setup.swap(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.forward_traced(req, id, tunnel, timing).await
     }
 
     pub async fn forward_traced(
@@ -261,7 +387,7 @@ impl Transport {
             let state = tokio::select! {
                 biased;
                 () = self.breaker.wait_blocked(id) => return stop_response(&self.breaker),
-                result = self.policy.check_state(id) => result,
+                result = Timing::measure_work(&timing, self.policy.check_state(id)) => result,
             };
             Timing::record(&timing, "state", phase_started);
             match state {
@@ -276,6 +402,13 @@ impl Transport {
         }
         if !self.provisioned(id) {
             return deny(StatusCode::SERVICE_UNAVAILABLE, "MANIFEST_UNAVAILABLE");
+        }
+        if self
+            .outbox
+            .as_ref()
+            .is_some_and(|outbox| !outbox.available(id))
+        {
+            return deny(StatusCode::SERVICE_UNAVAILABLE, "OUTBOX_UNAVAILABLE");
         }
         let destination = match destination(&req, tunnel.as_ref()) {
             Ok(value) => value,
@@ -294,10 +427,11 @@ impl Transport {
             );
         }
         let (mut parts, mut incoming) = req.into_parts();
+        let phase_started = Instant::now();
         let body = tokio::select! {
             biased;
             () = self.breaker.wait_blocked(id) => return stop_response(&self.breaker),
-            result = timeout(IO_TIMEOUT, async {
+            result = Timing::measure_work(&timing, timeout(IO_TIMEOUT, async {
                 let mut bytes = Vec::new();
                 while let Some(frame) = incoming.frame().await {
                     let frame = frame.map_err(|_| "REQUEST_BODY_UNAVAILABLE")?;
@@ -307,12 +441,13 @@ impl Transport {
                     } else { return Err("TRAILERS_NOT_ALLOWED"); }
                 }
                 Ok(bytes)
-            }) => match result {
+            })) => match result {
                 Ok(Ok(bytes)) => bytes,
                 Ok(Err(reason)) => return deny(StatusCode::BAD_REQUEST, reason),
                 Err(_) => return deny(StatusCode::REQUEST_TIMEOUT, "REQUEST_BODY_TIMEOUT"),
             }
         };
+        Timing::record(&timing, "request_body", phase_started);
         strip_hop_headers(&mut parts.headers);
         parts.headers.remove(header::HOST);
         parts.headers.remove(header::CONTENT_LENGTH);
@@ -320,15 +455,25 @@ impl Transport {
             "x-security-assessment-id",
             HeaderValue::from_str(&id.to_string()).unwrap(),
         );
+        let phase_started = Instant::now();
         let ip = tokio::select! {
             biased;
             () = self.breaker.wait_blocked(id) => return stop_response(&self.breaker),
-            result = timeout(Duration::from_secs(2), resolve(&destination)) => match result {
+            result = Timing::measure_work(&timing, timeout(Duration::from_secs(2), resolve(&destination))) => match result {
                 Ok(Ok(ip)) => ip,
                 _ => return deny(StatusCode::BAD_GATEWAY, "ORIGIN_RESOLUTION_UNAVAILABLE"),
             }
         };
+        Timing::record(&timing, "resolve", phase_started);
         let workspace = &self.workspaces[&id];
+        let outbox_slot = if let Some(outbox) = &self.outbox {
+            match outbox.try_reserve(id) {
+                Some(slot) => Some(slot),
+                None => return deny(StatusCode::SERVICE_UNAVAILABLE, "OUTBOX_UNAVAILABLE"),
+            }
+        } else {
+            None
+        };
         let phase_started = Instant::now();
         let admission_lock = tokio::select! {
             biased;
@@ -339,6 +484,13 @@ impl Transport {
             },
         };
         Timing::record(&timing, "admission_lock", phase_started);
+        if self
+            .outbox
+            .as_ref()
+            .is_some_and(|outbox| outbox.admission_blocked(id))
+        {
+            return deny(StatusCode::SERVICE_UNAVAILABLE, "OUTBOX_UNAVAILABLE");
+        }
         let timestamp = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .expect("UTC timestamp");
@@ -353,7 +505,7 @@ impl Transport {
         let reservation = tokio::select! {
             biased;
             () = self.breaker.wait_blocked(id) => return stop_response(&self.breaker),
-            result = self.policy.evaluate(&workspace.manifest, &policy_request) => match result {
+            result = Timing::measure_work(&timing, self.policy.evaluate(&workspace.manifest, &policy_request)) => match result {
                 Ok(receipt) => receipt,
                 Err(EvaluationError::Denied(reason)) => return deny(StatusCode::FORBIDDEN, reason),
                 Err(EvaluationError::Unavailable) => return deny(StatusCode::SERVICE_UNAVAILABLE, "POLICY_UNAVAILABLE"),
@@ -376,6 +528,7 @@ impl Transport {
                     ip,
                     timestamp,
                     timing,
+                    outbox_slot,
                 )
                 .await
         });
@@ -416,6 +569,7 @@ impl Transport {
         ip: IpAddr,
         timestamp: String,
         timing: Option<Timing>,
+        outbox_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Reply {
         let workspace = &self.workspaces[&id];
         let authority = if destination.host.contains(':') {
@@ -430,12 +584,28 @@ impl Transport {
             HeaderValue::from_str(&body.len().to_string()).unwrap(),
         );
         let request_record = json!({"method":method.as_str(),"host":destination.host,"ip":ip,"port":destination.port,"path":destination.path,"uri":destination.url.as_str(),"timestamp":timestamp,"headers":record_headers(&headers),"headers_hex":record_headers_hex(&headers),"body_hex":hex(&body)});
+        let intent = if let Some(outbox) = &self.outbox {
+            match outbox
+                .begin(
+                    id,
+                    reservation,
+                    request_record.clone(),
+                    outbox_slot.expect("reserved outbox slot"),
+                )
+                .await
+            {
+                Ok(event_id) => Some(event_id),
+                Err(_) => return deny(StatusCode::SERVICE_UNAVAILABLE, "OUTBOX_UNAVAILABLE"),
+            }
+        } else {
+            None
+        };
         let deadline = Instant::now() + IO_TIMEOUT;
         let phase_started = Instant::now();
         let origin = tokio::select! {
             biased;
             () = self.breaker.wait_blocked(id) => None,
-            result = timeout(IO_TIMEOUT, origin_request(&destination, ip, &workspace.origin_roots, method.clone(), headers, body)) => Some(result),
+            result = Timing::measure_work(&timing, timeout(IO_TIMEOUT, origin_request(&destination, ip, &workspace.origin_roots, method.clone(), headers, body))) => Some(result),
         };
         Timing::record(&timing, "origin_status", phase_started);
         let (mut origin, connection) = match origin {
@@ -447,8 +617,16 @@ impl Transport {
             // A proxy-generated 502 is never an origin completion. Leave the
             // ambiguous receipt outstanding for operator reconciliation.
             _ => {
-                self.record_incomplete(id, reservation, request_record, "ORIGIN_UNAVAILABLE")
-                    .await;
+                if let Some(event_id) = intent {
+                    self.outbox
+                        .as_ref()
+                        .unwrap()
+                        .finish(event_id, None, None, "ORIGIN_UNAVAILABLE")
+                        .await;
+                } else {
+                    self.record_incomplete(id, reservation, request_record, "ORIGIN_UNAVAILABLE")
+                        .await;
+                }
                 if self.breaker.blocked(id) {
                     return stop_response(&self.breaker);
                 }
@@ -456,11 +634,23 @@ impl Transport {
             }
         };
         let status = origin.status();
+        if intent.is_some() {
+            self.outbox
+                .as_ref()
+                .unwrap()
+                .observe_status(id, reservation, status.as_u16());
+            self.breaker.observe_final_status(
+                id,
+                status.as_u16(),
+                workspace.manifest.breaker_threshold(),
+                &self.policy,
+            );
+        }
         let mut response_headers = origin.headers().clone();
         let phase_started = Instant::now();
         let mut response_body = Vec::new();
         let mut error = None;
-        if headers_size(&response_headers) > MAX_HEADERS {
+        Timing::measure_work(&timing, async { if headers_size(&response_headers) > MAX_HEADERS {
             error = Some("RESPONSE_HEADERS_TOO_LARGE");
             response_headers.clear();
         } else if method != Method::HEAD && !matches!(status.as_u16(), 204 | 304) {
@@ -493,7 +683,7 @@ impl Transport {
                     }
                 }
             }
-        }
+        }}).await;
         Timing::record(&timing, "body", phase_started);
         // Drop the origin connection before the independent durable work.
         drop(origin);
@@ -504,8 +694,31 @@ impl Transport {
         if method != Method::HEAD && status.as_u16() != 304 {
             response_headers.remove(header::CONTENT_LENGTH);
         }
-        let event_id = Uuid::new_v4();
+        let event_id = intent.unwrap_or_else(Uuid::new_v4);
         let artifact = serde_json::to_vec(&json!({"engagement_id":id,"event_id":event_id,"reservation":reservation,"request":request_record,"response":{"status":status.as_u16(),"headers":response_headers_record,"headers_hex":response_headers_hex,"body_hex":hex(&response_body),"complete":error.is_none()},"error":error})).expect("bounded evidence serializes");
+        if let Some(event_id) = intent {
+            self.outbox
+                .as_ref()
+                .unwrap()
+                .finish(
+                    event_id,
+                    Some(String::from_utf8(artifact).expect("JSON is UTF8")),
+                    Some(status.as_u16()),
+                    "",
+                )
+                .await;
+            Timing::finish(&timing, &destination);
+            if self.breaker.blocked(id) {
+                return stop_response(&self.breaker);
+            }
+            if let Some(reason) = error {
+                return deny(StatusCode::BAD_GATEWAY, reason);
+            }
+            let mut response = Response::new(http_body_util::Full::new(Bytes::from(response_body)));
+            *response.status_mut() = status;
+            *response.headers_mut() = response_headers;
+            return response;
+        }
         let evidence_sha256 = format!("{:x}", Sha256::digest(&artifact));
         let phase_started = Instant::now();
         let evidence_ok = self
@@ -539,7 +752,7 @@ impl Transport {
             .await
             .is_ok();
         Timing::record(&timing, "settle", phase_started);
-        Timing::finish(&timing);
+        Timing::finish(&timing, &destination);
         drop(settlement_lock);
         if self.breaker.blocked(id) {
             return stop_response(&self.breaker);

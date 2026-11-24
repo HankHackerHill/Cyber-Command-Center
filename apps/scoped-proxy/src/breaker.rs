@@ -335,6 +335,22 @@ impl Breaker {
         Ok(())
     }
 
+    /// The durable path observes a newly received final origin status once,
+    /// synchronously before any further await. Settlement retries never call
+    /// this observer. Local denial precedes asynchronous durable stop delivery.
+    #[allow(dead_code)] // Standalone breaker integration tests compile this module.
+    pub fn observe_final_status(
+        &self,
+        id: Uuid,
+        status: u16,
+        threshold: NonZeroU64,
+        policy: &PolicyClient,
+    ) {
+        if self.observe(id, status, threshold) {
+            drop(self.deliver_stop(id, policy));
+        }
+    }
+
     fn observe(&self, id: Uuid, status: u16, threshold: NonZeroU64) -> bool {
         let mut state = self.state();
         if state.stopped.contains(&id) {

@@ -11,7 +11,10 @@ mocked. Only the loopback practice origin is synthetic. Example:
     --opa-url http://127.0.0.1:8181 --work-dir work/ms1
 
 The Python environment needs the three services' dependencies. --benchmark also
-runs the existing ignored release load test on this real stack. --profile runs
+runs HTTP and inspected-HTTPS release load gates on this real stack: absolute
+full-body E2E p99 <50 ms (median of three measured runs) and EVERY measured
+proxy-internal p99 <15 ms, with 1,000 requests per run after 64 warmup requests
+and four workers per protocol. --profile runs
 diagnostic HTTP requests (64 by default) with four workers and proxy phase traces;
 its timings do not substitute for the acceptance benchmark. Process logs,
 test-only keys, CAS artifacts and a machine-readable result remain in work-dir.
@@ -78,6 +81,32 @@ def json_request(url: str, method: str = "GET", value: object = None) -> tuple[i
         return response.status, json.loads(data) if data else None
     finally:
         connection.close()
+
+
+def await_delivery(processes: Processes, state_url: str, expected_completed: int,
+                   redis: object, accounting_key: str, outbox: Path,
+                   timeout: float = 120) -> list[dict[str, object]]:
+    """A client success is a durable local handoff, never an eventual-ledger proof."""
+    deadline = time.monotonic() + timeout
+    last = "not polled"
+    while time.monotonic() < deadline:
+        processes.check()
+        state = json.loads(redis.hget(accounting_key, "state"))
+        pending = len(list(outbox.glob("*.json")))
+        settled = state["active_workers"] == 0 and redis.hlen(accounting_key) == 1
+        if pending == 0 and settled:
+            status, records = json_request(state_url + "/ledger")
+            require(status == 200 and isinstance(records, list), "ledger read failed while draining")
+            completed = sum(record["event"].get("event_type") == "PROXY_REQUEST_COMPLETED"
+                            for record in records)
+            require(completed <= expected_completed, "duplicate/unexpected completed request audit")
+            if completed == expected_completed:
+                return records
+            last = f"completed={completed}/{expected_completed}"
+        else:
+            last = f"M4 pending={pending}, M3 active={state['active_workers']} receipts={redis.hlen(accounting_key) - 1}"
+        time.sleep(0.05)
+    raise TimeoutError(f"durable delivery did not drain: {last}")
 
 
 class Processes:
@@ -365,7 +394,13 @@ def main() -> int:
             assert spec is not None and spec.loader is not None
             policy_module = importlib.util.module_from_spec(spec)
             sys.modules[spec.name] = policy_module
-            spec.loader.exec_module(policy_module)
+            # Match the policy service's normal working-directory import path for
+            # its private sibling modules without leaving it ahead of contracts.
+            sys.path.insert(0, str(REPO / "apps/policy-svc"))
+            try:
+                spec.loader.exec_module(policy_module)
+            finally:
+                sys.path.pop(0)
             redis = Redis.from_url(args.redis_url, decode_responses=True, socket_timeout=3)
             stack.callback(redis.close)
             redis.ping()
@@ -385,10 +420,14 @@ def main() -> int:
                 POLICY_MANIFEST_DIR=str(manifests), EVIDENCE_ROOT=str(run / "evidence"),
                 SCOPED_PROXY_WORKSPACE_DIR=str(workspace.parent),
                 SCOPED_PROXY_LISTEN=f"127.0.0.1:{proxy_port}", M4_AUDIT_TOKEN=audit_token,
+                SCOPED_PROXY_OUTBOX_DIR=str(run / "proxy-outbox"),
+                ORCHESTRATOR_AUDIT_OUTBOX=str(run / "m2-audit.sqlite3"),
                 ORCHESTRATOR_OPERATOR_PUBLIC_KEYS=json.dumps({operator: public.hex()}),
                 PYTHONPATH=str(REPO / "packages/contracts-py"), PYTHONUNBUFFERED="1")
             if args.profile:
                 env["SCOPED_PROXY_TRACE_TIMING"] = "1"
+            if args.benchmark:
+                env["SCOPED_PROXY_TIMING_PATH"] = str(run / "proxy-internal.jsonl")
             for name, directory, port in [("orchestrator", "orchestrator", orchestrator_port),
                     ("policy", "policy-svc", policy_port), ("evidence", "evidence-svc", evidence_port)]:
                 processes.start(name, [args.python, "-m", "uvicorn", "main:app", "--host", "127.0.0.1",
@@ -443,8 +482,8 @@ def main() -> int:
                 status, body = proxied(proxy_port, origin.server_port, engagement, "/admin/reset-tenant", ca)
                 require(status == 403 and json.loads(body)["reason"] == "SCOPE_DENIED", f"{scheme} excluded path: {status} {body!r}")
                 require(len(origin.snapshot()) == 1, f"{scheme} out-of-scope origin hit")
-            status, records = json_request(state_url + "/ledger")
-            require(status == 200, "ledger read failed")
+            accounting_key = "redops:policy:v1:" + engagement
+            records = await_delivery(processes, state_url, 2, redis, accounting_key, run / "proxy-outbox")
             previous = "0" * 64
             completed = []
             for index, raw_record in enumerate(records):
@@ -460,7 +499,11 @@ def main() -> int:
                     keys.public_key().verify(bytes.fromhex(event.hitl_signature.signature), event.canonical_envelope())
                 elif event.event_type == "PROXY_REQUEST_COMPLETED":
                     completed.append(event)
-            require(len(records) >= 7 and len(completed) == 2, "expected two durable completed request audits")
+            denial_ids = {record["event"]["event_id"] for record in records
+                          if record["event"].get("event_type") == "POLICY_DENIED"
+                          and record["event"]["payload"].get("reason") == "SCOPE_DENIED"}
+            require(len(records) == 9 and len(completed) == 2 and len(denial_ids) == 2,
+                    "expected five transitions, two policy denials and two durable request audits")
             artifact_digests = []
             evidenced_ports = set()
             for event in completed:
@@ -494,13 +537,12 @@ def main() -> int:
                 require(len(stored) == len(records), "live ledger/API cardinality mismatch")
                 for row, record in zip(stored, records):
                     require(row[0] == record["event"] and row[1] == record["prev_record_hash"] and row[2] == record["record_hash"], "durable ledger/API mismatch")
-            accounting_key = "redops:policy:v1:" + engagement
             state = json.loads(redis.hget(accounting_key, "state"))
             require(state["active_workers"] == 0 and redis.hlen(accounting_key) == 1, "unsettled M3 receipts after success")
             result.update(status="passed", checks=["pre_roe_412_no_egress", "tampered_signature_denied",
                 "five_signed_transitions", "http_and_inspected_https", "canonical_attribution",
                 "exact_request_response_evidence", "durable_hash_chain", "m7_retrieval",
-                "excluded_path_403_no_egress", "redis_receipts_settled"],
+                "excluded_path_403_no_egress", "redis_receipts_settled", "durable_async_delivery_drained"],
                 ledger_rows=len(records), evidence_sha256=artifact_digests, ledger_tail=previous)
             if args.profile:
                 # This diagnostic uses the same signed engagement and all real service
@@ -534,10 +576,9 @@ def main() -> int:
                 hits = http_origin.snapshot()
                 require(len(hits) == args.profile_count + 1 and all(hit == {"path": "/ms1/check", "body": REQUEST_BODY,
                         "attribution": [engagement]} for hit in hits), "diagnostic origin attribution/body")
-                require(json.loads(redis.hget(accounting_key, "state"))["active_workers"] == 0 and
-                        redis.hlen(accounting_key) == 1, "diagnostic left M3 reservations")
-                status, profiled_records = json_request(state_url + "/ledger")
-                require(status == 200 and len(profiled_records) == len(records) + args.profile_count,
+                profiled_records = await_delivery(processes, state_url, 2 + args.profile_count,
+                    redis, accounting_key, run / "proxy-outbox")
+                require(len(profiled_records) == len(records) + args.profile_count,
                         "diagnostic ledger cardinality")
                 tail = "0" * 64
                 for raw_record in profiled_records:
@@ -553,7 +594,9 @@ def main() -> int:
                 print("Diagnostic profile: " + json.dumps(result["profile"]), flush=True)
             if args.benchmark:
                 benchmark_env = dict(env, M4_LOAD_PROXY_ADDR=f"127.0.0.1:{proxy_port}",
-                    M4_LOAD_ENGAGEMENT_ID=engagement, M4_LOAD_ORIGIN_PORT=str(free_port()))
+                    M4_LOAD_ENGAGEMENT_ID=engagement, M4_LOAD_CA_PEM=str(workspace / "ca.pem"),
+                    M4_LOAD_ORIGIN_CERT_PEM=str(cert), M4_LOAD_ORIGIN_KEY_PEM=str(key),
+                    M4_LOAD_PROOF_PATH=str(run / "benchmark-proofs.jsonl"))
                 path = run / "benchmark.log"
                 with path.open("wb") as log:
                     benchmark = subprocess.Popen(["cargo", "test", "--release", "--test", "load", "--", "--ignored", "--nocapture"],
@@ -569,10 +612,77 @@ def main() -> int:
                         except ProcessLookupError:
                             pass
                         benchmark.wait(timeout=5)
-                print(path.read_text())
+                output = path.read_text()
+                print(output)
+                summaries = [json.loads(line.removeprefix("M4_LOAD_RESULT ")) for line in output.splitlines()
+                             if line.startswith("M4_LOAD_RESULT ")]
+                result["benchmark"] = {"protocols": summaries, "returncode": benchmark.returncode,
+                    "timing_source": str(run / "proxy-internal.jsonl"), "log": str(path)}
                 require(benchmark.returncode == 0, f"benchmark failed; see {path}")
-                require(json.loads(redis.hget(accounting_key, "state"))["active_workers"] == 0 and redis.hlen(accounting_key) == 1, "benchmark left M3 reservations")
-                result["benchmark"] = "passed"
+                require(len(summaries) == 2 and {summary["protocol"] for summary in summaries} == {"http", "https"}
+                        and all(summary["passed"] for summary in summaries), "both protocol gate summaries required")
+                expected = 2 + (args.profile_count if args.profile else 0) + 2 * (64 + 3 * 1000)
+                final_records = await_delivery(processes, state_url, expected, redis, accounting_key,
+                                              run / "proxy-outbox", timeout=180)
+                # Triple acceptance audit: cardinality+uniqueness; complete hash chain;
+                # every benchmark evidence artifact's persisted bytes and attribution.
+                require(len(final_records) == 7 + expected, "benchmark ledger cardinality")
+                event_ids: set[str] = set()
+                reservations: set[str] = set()
+                tail = "0" * 64
+                benchmark_protocols = {"http": 0, "https": 0}
+                proofs = [json.loads(line) for line in (run / "benchmark-proofs.jsonl").read_text().splitlines()]
+                expected_proofs = {proof["uri"]: proof["body_hex"] for proof in proofs}
+                require(len(proofs) == len(expected_proofs) == 6128, "complete unique benchmark fixture proofs")
+                for raw_record in final_records:
+                    record = LedgerRecord.model_validate(raw_record)
+                    event = record.event
+                    computed = hashlib.sha256(bytes.fromhex(tail) + canonical(event.model_dump(mode="json"))).hexdigest()
+                    require(record.prev_record_hash == tail and record.record_hash == computed,
+                            "benchmark full ledger hash chain")
+                    tail = computed
+                    require(str(event.event_id) not in event_ids, "duplicate benchmark ledger event")
+                    event_ids.add(str(event.event_id))
+                    if isinstance(event, TransitionEvent):
+                        continue
+                    if event.event_type == "POLICY_DENIED":
+                        require(str(event.event_id) in denial_ids and event.payload["reason"] == "SCOPE_DENIED",
+                                "unexpected benchmark policy denial")
+                        continue
+                    require(event.event_type == "PROXY_REQUEST_COMPLETED", "unexpected benchmark audit event")
+                    reservation = event.payload["reservation"]
+                    require(reservation not in reservations, "duplicate benchmark reservation")
+                    reservations.add(reservation)
+                    digest = event.payload["evidence_sha256"]
+                    require(len(digest) == 64 and all(char in "0123456789abcdef" for char in digest), "invalid evidence digest")
+                    artifact_bytes = (run / "evidence" / "objects" / digest).read_bytes()
+                    require(hashlib.sha256(artifact_bytes).hexdigest() == digest, "benchmark M7 persisted evidence hash")
+                    artifact = json.loads(artifact_bytes)
+                    require(artifact["engagement_id"] == engagement and artifact["event_id"] == str(event.event_id)
+                            and artifact["reservation"] == reservation, "benchmark evidence identity binding")
+                    require(artifact["error"] is None and artifact["response"]["complete"] is True
+                            and artifact["response"]["status"] == 200 and event.payload["status"] == 200
+                            and event.payload["evidence_acknowledged"] is True, "benchmark complete acknowledged evidence")
+                    request = artifact["request"]
+                    attribution = [value for name, value in request["headers"] if name.lower() == ATTRIBUTION.lower()]
+                    require(attribution == [engagement], "benchmark evidence attribution")
+                    if request["path"].startswith("/m4-load/"):
+                        require(request["method"] == "GET" and request["body_hex"] == ""
+                                and request["uri"] in expected_proofs
+                                and artifact["response"]["body_hex"] == expected_proofs.pop(request["uri"]),
+                                "benchmark exact response evidence did not match client-validated fixture proof")
+                        protocol = request["uri"].split(":", 1)[0]
+                        require(protocol in benchmark_protocols, "benchmark evidence protocol")
+                        benchmark_protocols[protocol] += 1
+                require(not expected_proofs and benchmark_protocols == {"http": 3064, "https": 3064},
+                        "both benchmark protocols completely evidenced")
+                with psycopg.connect(args.database_url) as connection:
+                    durable_rows = connection.execute("SELECT count(*) FROM immutable_audit_log WHERE engagement_id=%s",
+                                                       (engagement,)).fetchone()[0]
+                require(durable_rows == len(final_records), "benchmark API/Postgres cardinality")
+                result["benchmark"].update(delivery_drained=True, ledger_rows=len(final_records),
+                    ledger_tail=tail, evidenced_requests=benchmark_protocols)
+                result["checks"].append("benchmark_every_request_durable_evidence_and_hash_chain")
             processes.check()
     except BaseException:
         result["status"] = "failed"

@@ -188,7 +188,9 @@ pub async fn serve<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let stream = accept_bound(client, prefix, config, &target.host).await?;
+    let stream = transport
+        .measure_tls_setup(accept_bound(client, prefix, config, &target.host))
+        .await?;
     let service = service_fn(move |request| {
         let transport = transport.clone();
         let target = target.clone();
