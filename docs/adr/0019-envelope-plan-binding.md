@@ -1,0 +1,2 @@
+# ADR-0019: Transition Envelope Plan Binding
+**Status:** Accepted. TransitionEvent gains optional approved_plan_id: UUID | None and approved_plan_hash: str | None, included in canonical_envelope() when present. Transitions from AWAITING_HITL_GATE to CONTROLLED_VALIDATION must carry both, and approved_plan_hash must equal the SHA-256 of the canonical JSON of the referenced validation_plans row — binding the human approval signature to the exact plan contents approved. Existing ledger rows and their hash chain must verify unchanged after the contracts change.
