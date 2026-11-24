@@ -1,7 +1,7 @@
 import { useState, type ChangeEvent } from 'react'
 import { createRoot } from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { createRootRoute, createRoute, createRouter, Link, Outlet, RouterProvider } from '@tanstack/react-router'
+import { createRootRoute, createRoute, createRouter, lazyRouteComponent, Link, Outlet, RouterProvider } from '@tanstack/react-router'
 import { Bot, FileCheck2, Fingerprint, GitFork, LayoutDashboard, Network, ShieldCheck, ShieldOff, Upload } from 'lucide-react'
 import { Pill } from '@ui'
 import { CockpitRoute } from './routes/cockpit'
@@ -9,7 +9,6 @@ import { SurfaceRoute } from './routes/surface'
 import { BoardRoute } from './routes/board'
 import { HitlRoute } from './routes/hitl'
 import { VaultRoute } from './routes/vault'
-import { StudioRoute } from './routes/studio'
 import { useWorkspace, WorkspaceProvider } from './workspace'
 import './styles.css'
 
@@ -93,7 +92,11 @@ const tree = root.addChildren([
   createRoute({ getParentRoute: () => root, path: '/board', component: BoardRoute }),
   createRoute({ getParentRoute: () => root, path: '/hitl', component: HitlRoute }),
   createRoute({ getParentRoute: () => root, path: '/vault', component: VaultRoute }),
-  createRoute({ getParentRoute: () => root, path: '/studio', component: StudioRoute }),
+  createRoute({
+    getParentRoute: () => root,
+    path: '/studio',
+    component: lazyRouteComponent(() => import('./routes/studio'), 'StudioRoute'),
+  }),
 ])
 const router = createRouter({ routeTree: tree })
 declare module '@tanstack/react-router' { interface Register { router: typeof router } }

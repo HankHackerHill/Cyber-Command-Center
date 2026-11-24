@@ -1,7 +1,9 @@
 import AxeBuilder from '@axe-core/playwright'
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page, type Response } from '@playwright/test'
+import { execFile } from 'node:child_process'
 import { createHash, sign } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
+import { promisify } from 'node:util'
 
 function required(name: string): string {
   const value = process.env[name]
@@ -13,9 +15,12 @@ const origin = required('M10_WEB_URL')
 const lockId = required('M10_LOCK_ID')
 const stopId = required('M10_STOP_ID')
 const reviewId = required('M10_REVIEW_ID')
+const reportId = required('M10_REPORT_ID')
 const operator = required('M10_OPERATOR')
 const fixtureBytes = Buffer.from('RedOps synthetic evidence. No client data.\n')
 const artifactSha256 = createHash('sha256').update(fixtureBytes).digest('hex')
+const reportEndpoint = '/api/report/render'
+const executeFile = promisify(execFile)
 
 function endpoint(engagementId: string, suffix: string): string {
   return `/api/orchestrator/engagements/${engagementId}/${suffix}`
@@ -30,6 +35,14 @@ async function attach(page: Page, engagementId: string): Promise<void> {
 
 async function open(page: Page, name: string): Promise<void> {
   await page.getByRole('link', { name, exact: true }).click()
+}
+
+async function renderReport(page: Page): Promise<Response> {
+  const [response] = await Promise.all([
+    page.waitForResponse(response => response.url() === `${origin}${reportEndpoint}` && response.request().method() === 'POST'),
+    page.getByRole('button', { name: 'Render report', exact: true }).click(),
+  ])
+  return response
 }
 
 const outbound = new WeakMap<Page, string[]>()
@@ -192,7 +205,7 @@ test('withholds the evidence download if the returned bytes fail SHA-256 verific
   await expect(page.getByRole('link', { name: 'Download verified artifact' })).toHaveCount(0)
 })
 
-test('shows supplied review work with unsupported approval and report actions blocked', async ({ page }) => {
+test('shows supplied review work with unsupported approvals blocked', async ({ page }) => {
   await attach(page, reviewId)
   await page.getByLabel('Import review snapshot', { exact: true }).setInputFiles(required('M10_SNAPSHOT_PATH'))
   await open(page, 'Task board')
@@ -219,9 +232,111 @@ test('shows supplied review work with unsupported approval and report actions bl
   await expect(page.getByText('GET /fixture/status HTTP/1.1', { exact: true })).toBeVisible()
   await expect(page.getByText('Read existing status only.', { exact: true })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Approve & Sign', exact: true })).toBeDisabled()
+})
 
+test('renders and downloads both verified reports with the recorded narrative', async ({ page, request }) => {
+  await page.goto('/')
   await open(page, 'Report studio')
   await expect(page.getByRole('heading', { name: 'Report Studio', exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Render report', exact: true })).toBeDisabled()
+
+  const wrongMethod = await request.get(reportEndpoint)
+  const foreign = await request.post(reportEndpoint, {
+    data: { engagement_id: reportId }, headers: { Origin: 'https://foreign.invalid' },
+  })
+  expect(wrongMethod.status()).toBe(404)
+  expect(foreign.status()).toBe(404)
+
+  await attach(page, reportId)
+  await open(page, 'Report studio')
+  await expect(page.getByText('Recorded inventory relationship', { exact: true })).toBeVisible()
+  // Read the reference JSON through Playwright's HTTP client. Chromium can evict
+  // the CDP response body even after Studio has successfully displayed it.
+  const reference = await request.post(reportEndpoint, { data: { engagement_id: reportId } })
+  expect(reference.status()).toBe(200)
+  const result = await reference.json()
+  const response = await renderReport(page)
+  expect(response.status()).toBe(200)
+  expect(response.request().postDataJSON()).toEqual({ engagement_id: reportId })
+  expect(result.engagement_id).toBe(reportId)
+  expect(result.teardown_receipt).toMatchObject({ engagement_id: reportId, status: 'completed' })
+  expect(result.ledger_excerpt).toEqual([expect.objectContaining({
+    event: expect.objectContaining({ engagement_id: reportId, event_type: 'EVIDENCE_FIXTURE' }),
+  })])
+  await expect(page.getByText('Report ready. PDF and DOCX checksums verified.', { exact: true })).toBeVisible()
+  await page.getByText('Report provenance', { exact: true }).click()
+  await expect(page.getByText(result.manifest_hash, { exact: true })).toBeVisible()
+  await expect(page.getByText(result.roe_signature_hash, { exact: true })).toBeVisible()
+  await expect(page.getByText(result.ledger_excerpt[0].record_hash, { exact: true })).toBeVisible()
+  await expect(page.getByText(result.teardown_receipt.completed_at, { exact: true })).toBeVisible()
+  const accessibility = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
+  expect(accessibility.violations.map(violation => ({ id: violation.id, nodes: violation.nodes.map(node => node.target) }))).toEqual([])
+
+  for (const extension of ['pdf', 'docx'] as const) {
+    const [download] = await Promise.all([
+      page.waitForEvent('download'),
+      page.getByRole('link', { name: `Download ${extension.toUpperCase()}`, exact: true }).click(),
+    ])
+    expect(download.suggestedFilename()).toBe(`${reportId}.${extension}`)
+    const path = await download.path()
+    const bytes = await readFile(path)
+    expect(createHash('sha256').update(bytes).digest('hex')).toBe(result[extension].sha256)
+    if (extension === 'pdf') {
+      expect(bytes.subarray(0, 5).toString('ascii')).toBe('%PDF-')
+    } else {
+      const { stdout: document } = await executeFile(required('M10_PYTHON'), [
+        '-c', 'import sys, zipfile; print(zipfile.ZipFile(sys.argv[1]).read("word/document.xml").decode())', path,
+      ], { encoding: 'utf8' })
+      expect(document).toContain('CHAIN_DERIVED · m10-fixture-chain')
+      expect(document).toContain('Entry point and hop 1 · m10-report-finding · Recorded inventory relationship')
+      expect(document).toContain(artifactSha256)
+    }
+  }
+})
+
+test('shows the real report prerequisite refusal without downloadable artifacts', async ({ page }) => {
+  await attach(page, reviewId)
+  await open(page, 'Report studio')
   await expect(page.getByText('Review maintenance access', { exact: true })).toBeVisible()
-  await expect(page.getByRole('button', { name: /render report/i })).toBeDisabled()
+  const response = await renderReport(page)
+  expect(response.status()).toBe(409)
+  await expect(page.getByRole('alert').filter({ hasText: 'All findings must be confirmed or marked false positive before rendering.' })).toBeVisible()
+  await expect(page.getByRole('link', { name: /^Download (PDF|DOCX)$/ })).toHaveCount(0)
+})
+
+test('withholds both reports if either returned document fails SHA-256 verification', async ({ page }) => {
+  await attach(page, reportId)
+  await open(page, 'Report studio')
+  await page.route(`${origin}${reportEndpoint}`, async route => {
+    const response = await route.fetch({ maxRedirects: 0 })
+    const result = await response.json()
+    const altered = Buffer.from(result.docx.content_base64, 'base64')
+    altered.writeUInt8(altered.readUInt8(altered.length - 1) ^ 1, altered.length - 1)
+    result.docx.content_base64 = altered.toString('base64')
+    await route.fulfill({ response, json: result })
+  })
+  expect((await renderReport(page)).status()).toBe(200)
+  await expect(page.getByRole('alert').filter({ hasText: 'The report documents do not match their SHA-256 digests.' })).toBeVisible()
+  await expect(page.getByRole('link', { name: /^Download (PDF|DOCX)$/ })).toHaveCount(0)
+})
+
+test('cancels an in-flight report when leaving Studio to switch engagements', async ({ page }) => {
+  await attach(page, reportId)
+  await open(page, 'Report studio')
+  const renderUrl = `${origin}${reportEndpoint}`
+  // Hold the request open so navigation occurs while a render is pending.
+  await page.route(renderUrl, () => {})
+  const sent = page.waitForRequest(request => request.url() === renderUrl)
+  await page.getByRole('button', { name: 'Render report', exact: true }).click()
+  expect((await sent).postDataJSON()).toEqual({ engagement_id: reportId })
+  await expect(page.getByRole('button', { name: 'Rendering…', exact: true })).toBeDisabled()
+
+  const canceled = page.waitForEvent('requestfailed', request => request.url() === renderUrl)
+  await open(page, 'Cockpit')
+  expect((await canceled).failure()?.errorText).toBe('net::ERR_ABORTED')
+  await page.getByRole('textbox', { name: 'Engagement ID', exact: true }).fill(reviewId)
+  await page.getByRole('button', { name: 'Attach engagement', exact: true }).click()
+  await open(page, 'Report studio')
+  await expect(page.getByText('Review maintenance access', { exact: true })).toBeVisible()
+  await expect(page.getByRole('link', { name: /^Download (PDF|DOCX)$/ })).toHaveCount(0)
 })

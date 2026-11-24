@@ -1,4 +1,4 @@
-"""Run browser acceptance against disposable, loopback-only M2, M6 and M7.
+"""Run browser acceptance against disposable, loopback-only M2, M6, M7 and M9.
 
 Use a Python environment with the existing services' dependencies, Docker with
 postgres:17-alpine and redis:7-alpine, and `npm ci` in apps/web. Chromium can be
@@ -28,6 +28,8 @@ from urllib.request import HTTPRedirectHandler, Request, ProxyHandler, build_ope
 from uuid import uuid4
 
 import psycopg
+from psycopg import sql
+from psycopg.conninfo import make_conninfo
 from psycopg.types.json import Jsonb
 from redis import Redis
 from cryptography.hazmat.primitives import serialization
@@ -37,6 +39,8 @@ WEB = Path(__file__).resolve().parents[1]
 REPO = WEB.parents[1]
 OPERATOR = "m10-fixture-operator"
 FINDING_ID = "m10-finding"
+REPORT_FINDING_ID = "m10-report-finding"
+REPORT_CHAIN_ID = "m10-fixture-chain"
 ARTIFACT = b"RedOps synthetic evidence. No client data.\n"
 T = TypeVar("T")
 
@@ -49,6 +53,7 @@ class TestSession:
     lock_id: str
     stop_id: str
     review_id: str
+    report_id: str
     signer_path: Path
     audit_token: str
     public_key: str
@@ -107,6 +112,7 @@ def start_session(stack: ExitStack, work_dir: Path) -> tuple[TestSession, Ed2551
         lock_id=str(uuid4()),
         stop_id=str(uuid4()),
         review_id=str(uuid4()),
+        report_id=str(uuid4()),
         signer_path=signer_path,
         audit_token=secrets.token_urlsafe(24),
         public_key=key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex(),
@@ -134,20 +140,35 @@ def provision_fixture(session: TestSession, key: Ed25519PrivateKey) -> Path:
     sys.path.insert(0, str(REPO / "packages/contracts-py"))
     from contracts.roe import RoeManifest
 
-    document = json.loads((REPO / "tests/fixtures/roe_sample.json").read_bytes())
-    document["engagement_id"] = session.lock_id
-    # No assessment traffic is enabled by this fixture.
-    document["scope_boundaries"]["allowed_identifiers"] = ["fixture.example.test"]
-    document["traffic_constraints"]["required_attribution_header"] = (
-        f"X-Security-Assessment-ID: {session.lock_id}"
-    )
-    normalized = RoeManifest.model_validate_json(canonical(document), strict=True)
-    unsigned = canonical(normalized.model_dump(mode="json", exclude={"signatures"}))
-    manifest_signature = key.sign(unsigned)
-    key.public_key().verify(manifest_signature, unsigned)
-    document = normalized.model_dump(mode="json")
-    document["signatures"]["lead_operator_sig"] = f"ed25519:{manifest_signature.hex()}"
-    manifest = RoeManifest.model_validate_json(canonical(document), strict=True)
+    def signed_manifest(engagement_id: str) -> tuple[RoeManifest, str]:
+        document = json.loads((REPO / "tests/fixtures/roe_sample.json").read_bytes())
+        document["engagement_id"] = engagement_id
+        document["scope_boundaries"]["allowed_identifiers"] = ["fixture.example.test"]
+        document["traffic_constraints"]["required_attribution_header"] = (
+            f"X-Security-Assessment-ID: {engagement_id}"
+        )
+        normalized = RoeManifest.model_validate_json(canonical(document), strict=True)
+        unsigned = canonical(normalized.model_dump(mode="json", exclude={"signatures"}))
+        signature = key.sign(unsigned)
+        key.public_key().verify(signature, unsigned)
+        document = normalized.model_dump(mode="json")
+        document["signatures"]["lead_operator_sig"] = f"ed25519:{signature.hex()}"
+        return RoeManifest.model_validate_json(canonical(document), strict=True), sha256(signature).hexdigest()
+
+    manifest, signature_hash = signed_manifest(session.lock_id)
+    report_manifest, _ = signed_manifest(session.report_id)
+    report_directory = session.work_dir / "reports" / session.report_id
+    report_directory.mkdir(parents=True)
+    (report_directory / "manifest.json").write_text(report_manifest.model_dump_json(), encoding="utf-8")
+    (report_directory / "teardown.json").write_bytes(canonical({
+        "engagement_id": session.report_id, "status": "completed",
+        "completed_at": "2026-01-01T12:00:00Z", "workspace_id": "m10-fixture-workspace",
+    }))
+    (report_directory / "report.json").write_bytes(canonical({
+        "engagement_id": session.report_id,
+        "findings": {REPORT_FINDING_ID: {"evidence_sha256s": [sha256(ARTIFACT).hexdigest()]}},
+        "chain_reviews": {REPORT_CHAIN_ID: {"impact_summary": "Reviewed synthetic inventory relationship."}},
+    }))
 
     # Use IDs from the known graph fixture, with simple synthetic labels and a
     # single documented reachability edge. This is read-only graph review.
@@ -189,21 +210,30 @@ def provision_fixture(session: TestSession, key: Ed25519PrivateKey) -> Path:
     with wait_for(lambda: psycopg.connect(session.postgres), "Fixture PostgreSQL") as db:
         db.execute((REPO / "db/schema.sql").read_text())
         db.execute("INSERT INTO engagements (id,roe_manifest,roe_signature_hash) VALUES (%s,%s,%s)", (
-            session.lock_id, Jsonb(manifest.model_dump(mode="json")), sha256(manifest_signature).hexdigest(),
+            session.lock_id, Jsonb(manifest.model_dump(mode="json")), signature_hash,
         ))
-        db.execute("INSERT INTO engagements (id) VALUES (%s),(%s)", (session.stop_id, engagement))
-        db.execute("INSERT INTO findings (engagement_id,id,title,confidence_score,status) VALUES (%s,%s,%s,%s,%s)", (
-            engagement, FINDING_ID, finding["title"], finding["confidence_score"], finding["status"],
+        db.execute("INSERT INTO engagements (id) VALUES (%s),(%s),(%s)", (
+            session.stop_id, engagement, session.report_id,
         ))
-        for node in nodes:
-            db.execute("""INSERT INTO asset_nodes (engagement_id,id,asset_category,canonical_identifier,
-                          metadata,discovered_by) VALUES (%s,%s,%s,%s,%s,%s)""", (
-                engagement, node["id"], node["asset_category"], node["canonical_identifier"],
-                Jsonb(node["metadata"]), node["discovered_by"],
+        for owner, finding_id, title in (
+            (engagement, FINDING_ID, finding["title"]),
+            (session.report_id, REPORT_FINDING_ID, "Recorded inventory relationship"),
+        ):
+            db.execute("INSERT INTO findings (engagement_id,id,title,confidence_score) VALUES (%s,%s,%s,%s)", (
+                owner, finding_id, title, finding["confidence_score"],
             ))
-        db.execute("""INSERT INTO asset_edges (engagement_id,id,src_node,dst_node,edge_kind,
-                      traversal_cost,proven_by_finding) VALUES (%s,%s,%s,%s,%s,%s,%s)""", (
-            engagement, edge["id"], src, dst, edge["edge_kind"], edge["traversal_cost"], FINDING_ID,
+            for node in nodes:
+                db.execute("""INSERT INTO asset_nodes (engagement_id,id,asset_category,canonical_identifier,
+                              metadata,discovered_by) VALUES (%s,%s,%s,%s,%s,%s)""", (
+                    owner, node["id"], node["asset_category"], node["canonical_identifier"],
+                    Jsonb(node["metadata"]), node["discovered_by"],
+                ))
+            db.execute("""INSERT INTO asset_edges (engagement_id,id,src_node,dst_node,edge_kind,
+                          traversal_cost,proven_by_finding) VALUES (%s,%s,%s,%s,%s,%s,%s)""", (
+                owner, edge["id"], src, dst, edge["edge_kind"], edge["traversal_cost"], finding_id,
+            ))
+        db.execute("INSERT INTO attack_chains (engagement_id,id,path_node_ids) VALUES (%s,%s,%s::uuid[])", (
+            session.report_id, REPORT_CHAIN_ID, [src, dst],
         ))
     return path
 
@@ -260,8 +290,8 @@ def start_service(stack: ExitStack, session: TestSession, name: str, env: dict[s
     return origin
 
 
-def link_evidence(session: TestSession, orchestrator: str, evidence: str) -> None:
-    receipt = http(f"{orchestrator}/engagements/{session.review_id}/audit-events", method="POST", data=canonical({
+def link_evidence(session: TestSession, orchestrator: str, evidence: str, *, engagement: str, finding: str) -> None:
+    receipt = http(f"{orchestrator}/engagements/{engagement}/audit-events", method="POST", data=canonical({
         "actor_kind": "SYSTEM", "actor_id": "scoped-proxy", "event_type": "EVIDENCE_FIXTURE",
         "payload": {"synthetic": True},
     }), headers={"Content-Type": "application/json", "Authorization": f"Bearer {session.audit_token}"})
@@ -269,9 +299,20 @@ def link_evidence(session: TestSession, orchestrator: str, evidence: str) -> Non
                     headers={"Content-Type": "application/octet-stream"})
     if artifact["sha256"] != sha256(ARTIFACT).hexdigest():
         raise RuntimeError("Synthetic artifact digest diverged")
-    http(f"{evidence}/link", method="POST", data=canonical({"engagement_id": session.review_id,
-         "finding_id": FINDING_ID, "sha256": artifact["sha256"], "record_hash": receipt["record_hash"]}),
+    http(f"{evidence}/link", method="POST", data=canonical({"engagement_id": engagement,
+         "finding_id": finding, "sha256": artifact["sha256"], "record_hash": receipt["record_hash"]}),
          headers={"Content-Type": "application/json"})
+
+
+def finalize_report_fixture(session: TestSession) -> str:
+    password = secrets.token_hex(20)
+    with psycopg.connect(session.postgres) as db:
+        # Model review of the seeded finding only after M7 accepted its ledger link.
+        db.execute("UPDATE findings SET status = 'CONFIRMED' WHERE engagement_id = %s AND id = %s",
+                   (session.report_id, REPORT_FINDING_ID))
+        db.execute(sql.SQL("CREATE ROLE m10_report_reader LOGIN PASSWORD {}").format(sql.Literal(password)))
+        db.execute("GRANT SELECT ON attack_chains, asset_nodes, asset_edges TO m10_report_reader")
+    return make_conninfo(session.postgres, user="m10_report_reader", password=password)
 
 
 def main() -> int:
@@ -295,13 +336,28 @@ def main() -> int:
         orchestrator = start_service(stack, session, "orchestrator", services)
         graph = start_service(stack, session, "graph-svc", services)
         evidence = start_service(stack, session, "evidence-svc", services)
-        link_evidence(session, orchestrator, evidence)
+        link_evidence(session, orchestrator, evidence, engagement=session.review_id, finding=FINDING_ID)
+        link_evidence(session, orchestrator, evidence, engagement=session.report_id, finding=REPORT_FINDING_ID)
+        report = start_service(stack, session, "report-svc", {
+            **base, "PYTHONPATH": services["PYTHONPATH"],
+            "ORCHESTRATOR_OPERATOR_PUBLIC_KEYS": services["ORCHESTRATOR_OPERATOR_PUBLIC_KEYS"],
+            "ORCHESTRATOR_URL": orchestrator, "GRAPH_URL": graph, "EVIDENCE_URL": evidence,
+            "REPORT_WORKSPACE_ROOT": str(work_dir / "reports"), "REPORT_DATABASE_URL": finalize_report_fixture(session),
+            "XDG_CACHE_HOME": str(work_dir / "cache"),
+        })
+        if sys.argv[1:] == ["--pact"]:
+            pact = start_process(stack, [sys.executable, str(WEB / "e2e/report_pact.py")], cwd=WEB, env={
+                **base, "M10_REPORT_URL": report, "M10_REPORT_ID": session.report_id,
+                "M10_REVIEW_ID": session.review_id, "M10_PACT_OUTPUT": str(work_dir / "pacts"),
+            })
+            return pact.wait(timeout=180)
+
         web_port = available_port()
         web = f"http://127.0.0.1:{web_port}"
         vite = start_process(stack, ["npm", "run", "dev", "--", "--host", "127.0.0.1", "--port",
                                      str(web_port), "--strictPort"], cwd=WEB,
                              env={**base, "REDOPS_ORCHESTRATOR_URL": orchestrator, "REDOPS_GRAPH_URL": graph,
-                                  "REDOPS_EVIDENCE_URL": evidence}, log=work_dir / "vite.log")
+                                  "REDOPS_EVIDENCE_URL": evidence, "REDOPS_REPORT_URL": report}, log=work_dir / "vite.log")
 
         def ready() -> object:
             if vite.poll() is not None:
@@ -312,7 +368,8 @@ def main() -> int:
             raise RuntimeError("Configured proxy did not reach the disposable orchestrator")
         test_env = {**base, "M10_WEB_URL": web, "M10_OPERATOR": OPERATOR, "M10_SIGNER_PATH": str(session.signer_path),
                     "M10_LOCK_ID": session.lock_id, "M10_STOP_ID": session.stop_id,
-                    "M10_REVIEW_ID": session.review_id, "M10_SNAPSHOT_PATH": str(snapshot),
+                    "M10_REVIEW_ID": session.review_id, "M10_REPORT_ID": session.report_id,
+                    "M10_SNAPSHOT_PATH": str(snapshot), "M10_PYTHON": sys.executable,
                     "M10_PLAYWRIGHT_OUTPUT": str(work_dir / "playwright"), "CI": "1"}
         chromium = os.environ.get("M10_CHROMIUM_EXECUTABLE") or shutil.which("chromium")
         if chromium:

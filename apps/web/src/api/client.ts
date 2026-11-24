@@ -3,6 +3,8 @@ import type {
   AssetNode,
   Ed25519Signature,
   EngagementState,
+  Finding,
+  FindingStatus,
   LedgerRecord,
   RecordedAuditEvent,
   TransitionEvent,
@@ -46,6 +48,20 @@ export interface ArtifactRef {
   url: string
 }
 
+interface ReportDocument {
+  filename: string
+  blob: Blob
+}
+
+export interface RenderedReport {
+  pdf: ReportDocument
+  docx: ReportDocument
+  manifestHash: string
+  roeSignatureHash: string
+  ledgerExcerpt: LedgerRecord[]
+  teardownCompletedAt: string
+}
+
 const messages: Record<string, string> = {
   ENGAGEMENT_NOT_FOUND: 'The orchestrator could not find this engagement.',
   ENGAGEMENT_ID_MISMATCH: 'The event belongs to another engagement.',
@@ -60,7 +76,25 @@ const messages: Record<string, string> = {
   RESPONSE_TOO_LARGE: 'The service response exceeds the cockpit download limit.',
   REQUEST_FAILED: 'The request failed. Refresh the engagement to check the result.',
   ARTIFACT_INTEGRITY: 'The downloaded bytes do not match the recorded SHA-256 digest.',
+  REPORT_INTEGRITY: 'The report documents do not match their SHA-256 digests.',
+  REPORT_ENGAGEMENT_NOT_FOUND: 'The report service could not find this engagement.',
+  REPORT_NOT_READY: 'The report service could not verify the reporting prerequisites.',
+  REPORT_FINDINGS_NOT_FINAL: 'All findings must be confirmed or marked false positive before rendering.',
+  REPORT_LEDGER_MISSING: 'The engagement needs a ledger excerpt before rendering.',
+  REPORT_MANIFEST_MISSING: 'The finalized signed scope manifest is missing.',
+  REPORT_TEARDOWN_MISSING: 'The completed teardown receipt is missing.',
+  REPORT_SOURCES_CHANGED: 'Report sources changed during rendering. Review and retry.',
+  REPORT_UNAVAILABLE: 'The report service or a required source is unavailable. Try again when it is ready.',
 }
+
+const reportRejections = new Map([
+  ['All findings must be CONFIRMED or FALSE_POSITIVE', 'REPORT_FINDINGS_NOT_FINAL'],
+  ['A ledger excerpt is required', 'REPORT_LEDGER_MISSING'],
+  ['Required report input missing: manifest.json', 'REPORT_MANIFEST_MISSING'],
+  ['Required report input missing: teardown.json', 'REPORT_TEARDOWN_MISSING'],
+  ['Findings changed during rendering. Review and retry.', 'REPORT_SOURCES_CHANGED'],
+  ['Attack chains changed during rendering. Review and retry.', 'REPORT_SOURCES_CHANGED'],
+])
 
 export class ApiError extends Error {
   constructor(public readonly status: number, public readonly reason: string) {
@@ -78,10 +112,18 @@ export const ENGAGEMENT_STATES = [
 const states = new Set<unknown>(ENGAGEMENT_STATES)
 const actorTypes = new Set<unknown>(['HUMAN_OPERATOR', 'SYSTEM', 'AI_AGENT'])
 const edgeKinds = new Set<unknown>(['SECRET_REUSE', 'IAM_ASSUME', 'NET_REACH', 'K8S_RBAC'])
+const findingStatuses = new Set<unknown>(['HYPOTHESIS', 'PENDING_VALIDATION', 'CONFIRMED', 'FALSE_POSITIVE',
+  'REMEDIATED'] satisfies FindingStatus[])
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i
 const digest = /^[a-f0-9]{64}$/
 const maxJsonBytes = 4 * 1024 * 1024
 const maxArtifactBytes = 32 * 1024 * 1024
+// One JSON response carries both Base64-encoded report formats.
+const maxReportBytes = 32 * 1024 * 1024
+const reportMediaTypes = {
+  pdf: 'application/pdf',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+} as const
 
 export function isEngagementId(value: unknown): value is string {
   return typeof value === 'string' && uuid.test(value)
@@ -133,6 +175,25 @@ function isLedgerRecord(value: unknown, id: string): value is LedgerRecord {
     && isLedgerEvent(value.event, id) && isDigest(value.prev_record_hash) && isDigest(value.record_hash)
 }
 
+function parseLedgerRecords(value: unknown, id: string, since = 0): LedgerRecord[] {
+  if (!Array.isArray(value)) invalidResponse()
+  const records: LedgerRecord[] = []
+  let prior = since
+  for (const record of value) {
+    if (!isLedgerRecord(record, id) || record.seq_id <= prior) invalidResponse()
+    prior = record.seq_id
+    records.push(record)
+  }
+  return records
+}
+
+function isFinding(value: unknown, id: string): value is Finding {
+  return isObject(value) && value.engagement_id === id && typeof value.id === 'string'
+    && typeof value.title === 'string' && typeof value.confidence_score === 'number'
+    && value.confidence_score >= 0 && value.confidence_score <= 1 && findingStatuses.has(value.status)
+    && (value.cvss_score == null || (typeof value.cvss_score === 'number' && value.cvss_score >= 0 && value.cvss_score <= 10))
+}
+
 function isEdge(value: unknown, id: string): value is AssetEdge {
   return isObject(value) && sameEngagement(value.engagement_id, id) && typeof value.id === 'string'
     && isEngagementId(value.src_node) && isEngagementId(value.dst_node) && edgeKinds.has(value.edge_kind)
@@ -155,7 +216,7 @@ function invalidResponse(): never {
   throw new ApiError(502, 'INVALID_RESPONSE')
 }
 
-type Service = 'orchestrator' | 'graph' | 'evidence'
+type Service = 'orchestrator' | 'graph' | 'evidence' | 'report'
 
 async function readBytes(response: Response, limit: number): Promise<Uint8Array<ArrayBuffer>> {
   const length = response.headers.get('content-length')
@@ -204,7 +265,7 @@ async function request(service: Service, path: string, options: {
   signal?: AbortSignal
   artifact?: boolean
 } = {}): Promise<Uint8Array<ArrayBuffer>> {
-  const deadline = AbortSignal.timeout(options.artifact ? 30_000 : 10_000)
+  const deadline = AbortSignal.timeout(service === 'report' ? 60_000 : options.artifact ? 30_000 : 10_000)
   const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline
   const headers = new Headers({ Accept: options.artifact ? 'application/octet-stream' : 'application/json' })
   if (options.body) headers.set('Content-Type', 'application/json')
@@ -221,11 +282,18 @@ async function request(service: Service, path: string, options: {
     })
     if (!response.ok) {
       let reason = `HTTP_${response.status}`
+      if (service === 'report' && response.status === 409) reason = 'REPORT_NOT_READY'
+      if (service === 'report' && response.status >= 500) reason = 'REPORT_UNAVAILABLE'
       if (response.headers.get('content-type')?.split(';')[0] === 'application/json') {
         try {
           const body = parseJson(await readBytes(response, 4096))
-          if (isObject(body) && typeof body.reason === 'string' && Object.hasOwn(messages, body.reason)) {
-            reason = body.reason
+          if (isObject(body)) {
+            if (service === 'report') {
+              if (response.status === 409 && typeof body.detail === 'string') reason = reportRejections.get(body.detail) ?? reason
+              if (response.status === 404 && body.detail === 'Engagement not found') reason = 'REPORT_ENGAGEMENT_NOT_FOUND'
+            } else if (typeof body.reason === 'string' && Object.hasOwn(messages, body.reason)) {
+              reason = body.reason
+            }
           }
         } catch {
           // Preserve the HTTP failure. Never echo untrusted error payloads.
@@ -239,10 +307,10 @@ async function request(service: Service, path: string, options: {
       await response.body?.cancel()
       invalidResponse()
     }
-    return await readBytes(response, options.artifact ? maxArtifactBytes : maxJsonBytes)
+    return await readBytes(response, service === 'report' ? maxReportBytes : options.artifact ? maxArtifactBytes : maxJsonBytes)
   } catch (error) {
     if (options.signal?.aborted || error instanceof ApiError) throw error
-    throw new ApiError(0, 'REQUEST_FAILED')
+    throw new ApiError(0, service === 'report' ? 'REPORT_UNAVAILABLE' : 'REQUEST_FAILED')
   }
 }
 
@@ -257,12 +325,14 @@ export async function getLedger(engagementId: string, since = 0, signal?: AbortS
   const id = normalizeEngagementId(engagementId)
   if (!Number.isSafeInteger(since) || since < 0) throw new Error('Invalid ledger offset.')
   const result = parseJson(await request('orchestrator', `/engagements/${id}/ledger?since=${since}`, { signal }))
-  if (!Array.isArray(result) || !result.every((record) => isLedgerRecord(record, id))) invalidResponse()
-  let prior = since
-  for (const record of result) {
-    if (record.seq_id <= prior) invalidResponse()
-    prior = record.seq_id
-  }
+  return parseLedgerRecords(result, id, since)
+}
+
+export async function getFindings(engagementId: string, signal?: AbortSignal): Promise<Finding[]> {
+  const id = normalizeEngagementId(engagementId)
+  const result = parseJson(await request('orchestrator', `/engagements/${id}/findings`, { signal }))
+  if (!Array.isArray(result) || !result.every((item) => isFinding(item, id))
+      || new Set(result.map((item) => item.id)).size !== result.length) invalidResponse()
   return result
 }
 
@@ -326,9 +396,57 @@ export async function downloadVerifiedArtifact(sha256: string, signal?: AbortSig
   if (!isDigest(sha256)) throw new Error('Invalid artifact SHA-256 digest.')
   if (!globalThis.crypto?.subtle) throw new Error('Evidence verification requires a secure browser context.')
   const bytes = await request('evidence', `/artifacts/${sha256}`, { artifact: true, signal })
+  if (!await matchesDigest(bytes, sha256, signal)) throw new ApiError(502, 'ARTIFACT_INTEGRITY')
+  return new Blob([bytes], { type: 'application/octet-stream' })
+}
+
+async function matchesDigest(bytes: Uint8Array<ArrayBuffer>, expected: string, signal?: AbortSignal): Promise<boolean> {
   const actual = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))
   signal?.throwIfAborted()
   const actualHex = Array.from(actual, (byte) => byte.toString(16).padStart(2, '0')).join('')
-  if (actualHex !== sha256) throw new ApiError(502, 'ARTIFACT_INTEGRITY')
-  return new Blob([bytes], { type: 'application/octet-stream' })
+  return actualHex === expected
+}
+
+async function verifyReportDocument(value: unknown, id: string, format: keyof typeof reportMediaTypes,
+    signal?: AbortSignal): Promise<ReportDocument> {
+  const filename = `${id}.${format}`
+  const mediaType = reportMediaTypes[format]
+  if (!isObject(value) || value.filename !== filename || value.media_type !== mediaType
+      || !isDigest(value.sha256) || typeof value.content_base64 !== 'string') invalidResponse()
+  let decoded: string
+  try {
+    decoded = atob(value.content_base64)
+  } catch {
+    return invalidResponse()
+  }
+  if (!decoded.length) invalidResponse()
+  const bytes = new Uint8Array(decoded.length)
+  for (let index = 0; index < decoded.length; index++) bytes[index] = decoded.charCodeAt(index)
+  if (!await matchesDigest(bytes, value.sha256, signal)) throw new ApiError(502, 'REPORT_INTEGRITY')
+  return { filename, blob: new Blob([bytes], { type: mediaType }) }
+}
+
+export async function renderReport(engagementId: string, signal?: AbortSignal): Promise<RenderedReport> {
+  const id = normalizeEngagementId(engagementId)
+  if (!globalThis.crypto?.subtle) throw new Error('Report verification requires a secure browser context.')
+  // The service's default sections include the evidence-backed narratives.
+  const result = parseJson(await request('report', '/render', { method: 'POST', body: { engagement_id: id }, signal }))
+  if (!isObject(result) || result.engagement_id !== id || !isDigest(result.manifest_hash)
+      || !isDigest(result.roe_signature_hash) || !isObject(result.teardown_receipt)) invalidResponse()
+  const receipt = result.teardown_receipt
+  if (receipt.engagement_id !== id || receipt.status !== 'completed' || typeof receipt.completed_at !== 'string'
+      || !/(?:Z|[+-]\d{2}:\d{2})$/.test(receipt.completed_at) || !Number.isFinite(Date.parse(receipt.completed_at))) invalidResponse()
+  if (!Array.isArray(result.ledger_excerpt) || !result.ledger_excerpt.length || result.ledger_excerpt.length > 25) invalidResponse()
+  const ledgerExcerpt = parseLedgerRecords(result.ledger_excerpt, id)
+  if (ledgerExcerpt.some((record, index) => index > 0 && record.prev_record_hash !== ledgerExcerpt[index - 1].record_hash)) {
+    invalidResponse()
+  }
+  const pdf = await verifyReportDocument(result.pdf, id, 'pdf', signal)
+  const docx = await verifyReportDocument(result.docx, id, 'docx', signal)
+  return {
+    pdf, docx, ledgerExcerpt,
+    manifestHash: result.manifest_hash,
+    roeSignatureHash: result.roe_signature_hash,
+    teardownCompletedAt: receipt.completed_at,
+  }
 }
