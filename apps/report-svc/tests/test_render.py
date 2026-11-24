@@ -9,18 +9,23 @@ import sys
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
+from uuid import UUID
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
 import pytest
 from pypdf import PdfReader
 
-from render import ReportData, ReportFinding, Section, render_report
+from render import NarrativeHop, ReportChain, ReportData, ReportFinding, Section, render_report
 
 WORD_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 ARTIFACT = "/artifacts/" + "ae" * 32
+SECOND_ARTIFACT = "/artifacts/" + "b4" * 32
 OWNER = "d01269c1-1180-454b-b41e-499db0484bbc"
 VECTOR = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H"
+ENTRY = UUID("11111111-1111-4111-8111-111111111111")
+INTERMEDIATE = UUID("22222222-2222-4222-8222-222222222222")
+TERMINAL = UUID("33333333-3333-4333-8333-333333333333")
 
 
 def example_report() -> ReportData:
@@ -48,6 +53,19 @@ def example_report() -> ReportData:
     )
 
 
+def example_chain_report() -> ReportData:
+    data = example_report()
+    first = replace(data.findings[0], cwe="CWE-778 — Insufficient Logging")
+    second = replace(data.findings[1], evidence_links=(SECOND_ARTIFACT,))
+    return replace(data, findings=(first, second), chains=(ReportChain(
+        id="reviewed-chain-01",
+        hops=(NarrativeHop(first, "Compared archived audit records.", ENTRY, INTERMEDIATE),
+              NarrativeHop(second, None, INTERMEDIATE, TERMINAL)),
+        impact_summary="The audit record is incomplete.", tier0_reached=True, path_cost=3.5,
+        operator_override="The operator recorded a narrower interpretation.",
+    ),))
+
+
 def docx_paragraphs(docx: bytes) -> list[str]:
     with ZipFile(BytesIO(docx)) as package:
         document = ET.fromstring(package.read("word/document.xml"))
@@ -71,11 +89,11 @@ def test_byte_identical_in_fresh_processes() -> None:
     command = (
         "from hashlib import sha256\n"
         "from render import Section, render_report\n"
-        "from test_render import example_report\n"
-        "document = render_report(example_report(), list(Section))\n"
+        "from test_render import example_chain_report\n"
+        "document = render_report(example_chain_report(), list(Section))\n"
         "print(sha256(document.pdf).hexdigest(), sha256(document.docx).hexdigest())"
     )
-    actual = render_report(example_report(), list(Section))
+    actual = render_report(example_chain_report(), list(Section))
     expected = f"{hashlib.sha256(actual.pdf).hexdigest()} {hashlib.sha256(actual.docx).hexdigest()}"
     for seed in ("132", "874"):
         search_path = os.pathsep.join((str(root), str(root / "tests"), *sys.path))
@@ -197,7 +215,10 @@ SECTION_SNAPSHOTS = {
         "Evidence links (M7 paths)", "No evidence links supplied.", "Reproduction steps",
         "No reviewed reproduction steps supplied.",
     ),
-    "Attack narratives": ("The inventory and audit export identify the same reviewed asset.",),
+    "Attack narratives": (
+        "OPERATOR_PROVIDED · Supplemental narratives",
+        "The inventory and audit export identify the same reviewed asset.",
+    ),
     "Prioritized remediation": (
         "1. OBS-001 · Missing audit entries", "CVSS v4.0: 10.0",
         "Enable audit logging and verify the retention policy.",
@@ -245,3 +266,42 @@ def test_exported_section_snapshot(
     expected = " ".join(SECTION_SNAPSHOTS[heading])
     assert pdf[heading] == expected
     assert docx[heading] == expected
+
+
+def test_exported_chain_narrative_snapshot() -> None:
+    exported = render_report(example_chain_report(), [Section.ATTACK_NARRATIVES])
+    expected = " ".join((
+        "OPERATOR_PROVIDED · Narrative override for reviewed-chain-01",
+        "The operator recorded a narrower interpretation.",
+        "CHAIN_DERIVED · reviewed-chain-01",
+        "Path includes findings without CONFIRMED disposition.",
+        "Entry point and hop 1 · OBS-001 · Missing audit entries",
+        "Status: CONFIRMED",
+        "Technique: Compared archived audit records.",
+        "CVSS v4.0: 10.0", VECTOR,
+        f"Graph nodes: {ENTRY} → {INTERMEDIATE}",
+        "CWE: CWE-778 — Insufficient Logging",
+        "Evidence SHA-256 and retrieval (M7 paths)", ARTIFACT,
+        "Hop 2 · OBS-002 · Retention setting reviewed",
+        "Status: FALSE_POSITIVE",
+        "Technique: No reviewed summary supplied.",
+        "CVSS v4.0: Unscored",
+        f"Graph nodes: {INTERMEDIATE} → {TERMINAL}",
+        "CWE: Unmapped",
+        "Evidence SHA-256 and retrieval (M7 paths)", SECOND_ARTIFACT,
+        "Impact summary: The audit record is incomplete.",
+        "Tier-0 reached (recorded path): true",
+        "CVSS v4.0 rollup (maximum hop score): 10.0",
+        "Graph path cost: 3.5",
+        "OPERATOR_PROVIDED · Supplemental narratives",
+        "The inventory and audit export identify the same reviewed asset.",
+    ))
+    pdf_body = "\n".join(page.rsplit("\n", 1)[0] for page in pdf_pages(exported.pdf))
+    for body in (pdf_body, "\n".join(docx_paragraphs(exported.docx))):
+        assert normalized(body.split("Attack narratives", 1)[1].split("Appendix", 1)[0]) == expected
+        assert "CWE taxonomy attribution" in body
+    with ZipFile(BytesIO(exported.docx)) as package:
+        relations = ET.fromstring(package.read("word/_rels/document.xml.rels"))
+        assert {relation.attrib["Target"] for relation in relations if relation.attrib.get("TargetMode") == "External"} == {
+            ARTIFACT, SECOND_ARTIFACT,
+        }

@@ -4,19 +4,23 @@ import base64
 import hashlib
 import json
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from io import BytesIO
 from pathlib import Path
 from uuid import UUID
+from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
 import httpx
 import pytest
+from contracts.findings import AssetEdge
 from contracts.roe import RoeManifest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 from pypdf import PdfReader
+from pydantic import TypeAdapter
 
+from chains import ChainHop, ChainPath
 from main import create_app
 
 OWNER = UUID("1cabb07a-a07f-438e-b1e6-1d770aa51bae")
@@ -26,7 +30,13 @@ DIGEST = hashlib.sha256(b"stored synthetic evidence").hexdigest()
 FINDINGS_PATH = f"/engagements/{OWNER}/findings"
 LEDGER_PATH = f"/engagements/{OWNER}/ledger"
 EVIDENCE_PATH = f"/findings/{FINDING}/evidence"
-SAMPLE = Path(__file__).resolve().parents[3] / "tests/fixtures/roe_sample.json"
+FIXTURES = Path(__file__).resolve().parents[3] / "tests/fixtures"
+WORD_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+CHAIN_ID = "review-chain-01"
+BASE_VECTOR = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:L/VA:N/SC:N/SI:N/SA:N"
+MAX_VECTOR = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H"
+OPERATOR_NOTE = "The operator reviewed the chain against the final assessment evidence."
+OPERATOR_OVERRIDE = "The operator clarified the impact in the final review."
 SECTIONS = [
     "cover", "executive_summary", "methodology", "findings",
     "finding_details", "attack_narratives", "remediation", "appendix",
@@ -66,13 +76,34 @@ class SourceFixture:
     manifest: RoeManifest
     findings: list[dict[str, object]]
     ledger: list[dict[str, object]]
-    evidence: list[dict[str, str]]
+    evidence: dict[str, list[dict[str, str]]]
     next_findings: list[dict[str, object]] | None = None
     overrides: dict[str, httpx.Response] = field(default_factory=dict)
     requests: list[httpx.Request] = field(default_factory=list)
+    chain_paths: tuple[ChainPath, ...] = ()
+    next_chain_paths: tuple[ChainPath, ...] | None = None
+    artifacts: dict[str, bytes] = field(default_factory=dict)
+    graph_edges: tuple[AssetEdge, ...] = ()
+    graph_available: bool = True
+    graph_requests: list[dict[str, str]] = field(default_factory=list)
+
+    def load(self, engagement_id: UUID) -> tuple[ChainPath, ...]:
+        assert engagement_id == OWNER
+        paths = self.chain_paths
+        if self.next_chain_paths is not None:
+            self.chain_paths = self.next_chain_paths
+            self.next_chain_paths = None
+        return paths
 
     def upstream(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
+        if request.url.host == "m6.test":
+            assert request.method == "POST" and request.url.path == "/paths"
+            assert not request.url.params
+            self.graph_requests.append(json.loads(request.content))
+            if not self.graph_available:
+                raise httpx.ConnectError("Mock graph service unavailable", request=request)
+            return httpx.Response(200, json=[edge.model_dump(mode="json") for edge in self.graph_edges])
         assert request.method == "GET"
         if request.url.path in self.overrides:
             return self.overrides[request.url.path]
@@ -85,15 +116,23 @@ class SourceFixture:
         if request.url.host == "m2.test" and request.url.path == LEDGER_PATH:
             assert request.url.params.get("since", "0") == "0"
             return httpx.Response(200, json=self.ledger)
-        if request.url.host == "m7.test" and request.url.path == EVIDENCE_PATH:
-            assert request.url.params.get("engagement_id") == str(OWNER)
-            return httpx.Response(200, json=self.evidence)
+        if request.url.host == "m7.test":
+            path = request.url.path
+            if path.startswith("/findings/") and path.endswith("/evidence"):
+                assert request.url.params.get("engagement_id") == str(OWNER)
+                finding_id = path.removeprefix("/findings/").removesuffix("/evidence")
+                return httpx.Response(200, json=self.evidence[finding_id])
+            if path.startswith("/artifacts/"):
+                assert not request.url.params
+                content = self.artifacts.get(path.removeprefix("/artifacts/"))
+                return httpx.Response(404) if content is None else httpx.Response(200, content=content)
         pytest.fail(f"Unexpected service request {request.method} {request.url}")
 
     def client(self) -> TestClient:
         return TestClient(create_app(
             workspace_root=self.workspace.parent, orchestrator_url="http://m2.test",
             evidence_url="http://m7.test", public_keys={"lead-op": self.key.public_key()},
+            chain_repository=self, graph_url="http://m6.test" if self.chain_paths else "",
             transport=httpx.MockTransport(self.upstream),
         ))
 
@@ -103,7 +142,7 @@ def source(tmp_path: Path) -> SourceFixture:
     directory = tmp_path / str(OWNER)
     directory.mkdir()
     key = Ed25519PrivateKey.generate()
-    data = json.loads(SAMPLE.read_bytes())
+    data = json.loads((FIXTURES / "roe_sample.json").read_bytes())
     data["engagement_id"] = str(OWNER)
     data["traffic_constraints"]["required_attribution_header"] = f"X-Security-Assessment-ID: {OWNER}"
     data["signatures"]["lead_operator_sig"] = "ed25519:" + "0" * 128
@@ -128,8 +167,62 @@ def source(tmp_path: Path) -> SourceFixture:
         directory, key, manifest,
         [{"id": FINDING, "engagement_id": str(OWNER), "title": "Recorded review finding",
           "confidence_score": 0.92, "cvss_score": None, "status": "CONFIRMED"}],
-        ledger_rows(key), [{"sha256": DIGEST, "url": f"/artifacts/{DIGEST}"}],
+        ledger_rows(key), {FINDING: [{"sha256": DIGEST, "url": f"/artifacts/{DIGEST}"}]},
     )
+
+
+@pytest.fixture
+def chain_source(source: SourceFixture) -> SourceFixture:
+    fixture = json.loads((FIXTURES / "graph_known.json").read_bytes())
+    expected = fixture["expected"]["shortest_path_entry_to_tier0"]
+    nodes = tuple(UUID(node_id) for node_id in expected["path_node_ids"])
+    edges = TypeAdapter(tuple[AssetEdge, ...]).validate_python([
+        dict(edge, engagement_id=str(OWNER)) for edge in fixture["edges"]
+    ])
+    selected = tuple(
+        next(edge for edge in edges if edge.src_node == src and edge.dst_node == dst)
+        for src, dst in zip(nodes[:-1], nodes[1:], strict=True)
+    )
+    assert sum(edge.traversal_cost for edge in selected) == expected["total_traversal_cost"]
+    names = {UUID(node["id"]): node["canonical_identifier"].rsplit("/", 1)[-1] for node in fixture["nodes"]}
+    findings = []
+    hops = []
+    notes: dict[str, object] = {}
+    source.evidence.clear()
+    vectors = (BASE_VECTOR, MAX_VECTOR, BASE_VECTOR + "/E:U")
+    for number, (edge, vector) in enumerate(zip(selected, vectors, strict=True), 1):
+        finding_id = edge.proven_by_finding
+        assert finding_id is not None
+        findings.append({
+            "id": finding_id, "engagement_id": str(OWNER),
+            "title": f"Recorded access to {names[edge.dst_node]}", "confidence_score": 0.92,
+            "cvss_score": None, "status": "CONFIRMED",
+        })
+        hops.append(ChainHop(finding_id=finding_id, edge_ids=(edge.id,)))
+        links = []
+        for evidence_number in range(2 if number == 1 else 1):
+            content = f"Synthetic reviewed observation {finding_id} record {evidence_number}".encode()
+            digest = hashlib.sha256(content).hexdigest()
+            source.artifacts[digest] = content
+            links.append({"sha256": digest, "url": f"/artifacts/{digest}"})
+        source.evidence[finding_id] = links
+        notes[finding_id] = {
+            "technique_summary": f"The assessment ledger records observation {number}.",
+            "cwe": "CWE-79", "cvss_vector": vector,
+            "evidence_sha256s": [link["sha256"] for link in links],
+        }
+    source.findings = findings
+    source.chain_paths = (ChainPath(
+        id=CHAIN_ID, node_ids=nodes, hops=tuple(hops),
+        tier0_reached=str(nodes[-1]) in fixture["tier0_node_ids"],
+    ),)
+    source.graph_edges = selected
+    (source.workspace / "report.json").write_bytes(canonical({
+        "engagement_id": str(OWNER), "findings": notes,
+        "chain_reviews": {CHAIN_ID: {"impact_summary": "The reviewed path reached the critical role."}},
+        "attack_narratives": [OPERATOR_NOTE],
+    }))
+    return source
 
 
 @pytest.fixture
@@ -149,6 +242,19 @@ def assert_refused(response: httpx.Response, status: int) -> None:
     payload = response.json()
     assert "pdf" not in payload and "docx" not in payload
     assert "content_base64" not in response.text
+
+
+def narrative_texts(response: httpx.Response) -> tuple[str, str]:
+    assert response.status_code == 200, response.text[:2048]
+    result = response.json()
+    pdf = base64.b64decode(result["pdf"]["content_base64"], validate=True)
+    docx = base64.b64decode(result["docx"]["content_base64"], validate=True)
+    pdf_text = " ".join(page.extract_text() for page in PdfReader(BytesIO(pdf)).pages)
+    with ZipFile(BytesIO(docx)) as archive:
+        root = ET.fromstring(archive.read("word/document.xml"))
+    docx_text = " ".join("".join(fragment.text or "" for fragment in paragraph.iter(f"{WORD_NS}t"))
+                         for paragraph in root.iter(f"{WORD_NS}p"))
+    return " ".join(pdf_text.split()), " ".join(docx_text.split())
 
 
 def test_http_render_provenance_and_real_documents(source: SourceFixture, client: TestClient) -> None:
@@ -172,9 +278,12 @@ def test_http_render_provenance_and_real_documents(source: SourceFixture, client
         if extension == "pdf":
             pdf_text = " ".join(page.extract_text() for page in PdfReader(BytesIO(contents)).pages)
             assert "Recorded review finding" in " ".join(pdf_text.split())
+            assert "OPERATOR_PROVIDED" in pdf_text and "CHAIN_DERIVED" not in pdf_text
         else:
             with ZipFile(BytesIO(contents)) as archive:
-                assert b"Recorded review finding" in archive.read("word/document.xml")
+                xml = archive.read("word/document.xml")
+                assert b"Recorded review finding" in xml
+                assert b"OPERATOR_PROVIDED" in xml and b"CHAIN_DERIVED" not in xml
     assert {request.url.path for request in source.requests} == {FINDINGS_PATH, LEDGER_PATH, EVIDENCE_PATH}
 
 
@@ -238,7 +347,7 @@ def test_corrupt_or_cross_engagement_sources_fail_closed(
     elif mismatch == "seq_order":
         source.ledger[1]["seq_id"] = 3
     else:
-        source.evidence[0]["url"] = "https://untrusted.invalid/artifacts/" + DIGEST
+        source.evidence[FINDING][0]["url"] = "https://untrusted.invalid/artifacts/" + DIGEST
     assert_refused(render(client), 502)
 
 
@@ -253,9 +362,12 @@ def test_tampered_manifest_refuses_output(source: SourceFixture, client: TestCli
 
 def test_missing_manifest_trust_store_fails_closed(source: SourceFixture) -> None:
     app = create_app(workspace_root=source.workspace.parent, orchestrator_url="http://m2.test",
-                     evidence_url="http://m7.test", public_keys={}, transport=httpx.MockTransport(source.upstream))
+                     evidence_url="http://m7.test", public_keys={}, chain_repository=source,
+                     transport=httpx.MockTransport(source.upstream))
     with TestClient(app) as connected:
-        assert_refused(render(connected), 503)
+        response = render(connected)
+        assert_refused(response, 503)
+        assert response.json()["detail"] == "Operator trust store unavailable"
 
 
 def test_duplicate_operator_key_rejects_the_entire_trust_store(
@@ -266,9 +378,12 @@ def test_duplicate_operator_key_rejects_the_entire_trust_store(
     # A permissive last-key-wins decoder would verify the signed fixture here.
     monkeypatch.setenv("ORCHESTRATOR_OPERATOR_PUBLIC_KEYS", f'{{"lead-op":"{other}","lead-op":"{valid}"}}')
     app = create_app(workspace_root=source.workspace.parent, orchestrator_url="http://m2.test",
-                     evidence_url="http://m7.test", transport=httpx.MockTransport(source.upstream))
+                     evidence_url="http://m7.test", chain_repository=source,
+                     transport=httpx.MockTransport(source.upstream))
     with TestClient(app) as connected:
-        assert_refused(render(connected), 503)
+        response = render(connected)
+        assert_refused(response, 503)
+        assert response.json()["detail"] == "Invalid operator key configuration"
 
 
 def test_foreign_teardown_refuses_output(source: SourceFixture, client: TestClient) -> None:
@@ -303,3 +418,130 @@ def test_failed_dependency_never_emits_a_report(source: SourceFixture, client: T
 def test_orchestrator_unknown_engagement(source: SourceFixture, client: TestClient) -> None:
     source.overrides[FINDINGS_PATH] = httpx.Response(404, json={"reason": "ENGAGEMENT_NOT_FOUND"})
     assert_refused(render(client), 404)
+
+
+def test_narrative_render_requires_configured_chain_source(source: SourceFixture) -> None:
+    app = create_app(
+        workspace_root=source.workspace.parent, orchestrator_url="http://m2.test",
+        evidence_url="http://m7.test", database_url="", public_keys={"lead-op": source.key.public_key()},
+        transport=httpx.MockTransport(source.upstream),
+    )
+    with TestClient(app) as connected:
+        response = render(connected, ["attack_narratives"])
+        assert_refused(response, 503)
+        assert response.json()["detail"] == "Attack chain storage is not configured"
+        assert render(connected, ["findings"]).status_code == 200
+
+
+def test_attack_chain_narrative_renders_all_verified_hops(chain_source: SourceFixture) -> None:
+    with chain_source.client() as connected:
+        texts = narrative_texts(render(connected, ["attack_narratives"]))
+
+    nodes = chain_source.chain_paths[0].node_ids
+    assert chain_source.graph_requests == [{"engagement_id": str(OWNER), "src": str(nodes[0]), "dst": str(nodes[-1])}]
+    assert sorted(request.url.path for request in chain_source.requests if request.url.path.startswith("/artifacts/")) == [
+        f"/artifacts/{digest}" for digest in sorted(chain_source.artifacts)
+    ]
+    for text in texts:
+        assert all(label in text for label in ("Attack narratives", CHAIN_ID, "CHAIN_DERIVED", "OPERATOR_PROVIDED"))
+        assert OPERATOR_NOTE in text
+        assert "The reviewed path reached the critical role." in text
+        assert "Graph path cost: 3.5" in text
+        assert "Tier-0 reached (recorded path): true" in text
+        assert "CVSS v4.0 rollup (maximum hop score): 10.0" in text
+        assert "Entry point and hop 1" in text
+        title_positions = [
+            text.index(f"Recorded access to {role}") for role in ("deploy-reader", "ecs-task-role", "org-admin")
+        ]
+        assert title_positions == sorted(title_positions)
+        for position, (hop, start) in enumerate(zip(chain_source.chain_paths[0].hops, title_positions, strict=True)):
+            end = title_positions[position + 1] if position + 1 < len(title_positions) else len(text)
+            hop_text = text[start:end]
+            assert f"The assessment ledger records observation {position + 1}." in hop_text
+            assert "CWE-79" in hop_text
+            assert f"CVSS v4.0: {('8.8', '10.0', '6.7')[position]}" in hop_text
+            assert all(link["url"] in "".join(hop_text.split()) for link in chain_source.evidence[hop.finding_id])
+            assert hop.finding_id in text
+        assert all(str(node) in text for node in nodes)
+
+
+def write_override(source: SourceFixture) -> None:
+    path = source.workspace / "report.json"
+    review = json.loads(path.read_bytes())
+    review["chain_reviews"][CHAIN_ID]["operator_override"] = OPERATOR_OVERRIDE
+    path.write_bytes(canonical(review))
+
+
+@pytest.mark.parametrize(("failure", "reason"), [
+    ("not-found", "returned HTTP 404"),
+    ("wrong-bytes", "failed SHA-256 verification"),
+    ("missing-pin", "is absent from linked evidence"),
+])
+def test_attack_chain_refuses_unresolvable_evidence_even_with_override(
+    chain_source: SourceFixture, failure: str, reason: str,
+) -> None:
+    write_override(chain_source)
+    finding_id = chain_source.chain_paths[0].hops[0].finding_id
+    digest = chain_source.evidence[finding_id][-1]["sha256"]
+    if failure == "not-found":
+        del chain_source.artifacts[digest]
+    elif failure == "wrong-bytes":
+        chain_source.artifacts[digest] = b"Different reviewed evidence"
+    else:
+        chain_source.evidence[finding_id].pop()
+    with chain_source.client() as connected:
+        response = render(connected, ["attack_narratives"])
+    assert_refused(response, 409)
+    assert response.json()["detail"] == (
+        f"Attack chain '{CHAIN_ID}', hop 1, finding '{finding_id}': M7 artifact {digest} {reason}"
+    )
+
+
+def test_attack_chain_labels_false_positive_and_operator_override(chain_source: SourceFixture) -> None:
+    write_override(chain_source)
+    chain_source.findings[1]["status"] = "FALSE_POSITIVE"
+    with chain_source.client() as connected:
+        texts = narrative_texts(render(connected, ["attack_narratives"]))
+    for text in texts:
+        assert "FALSE_POSITIVE" in text
+        assert "Recorded access to ecs-task-role" in text
+        assert "CHAIN_DERIVED" in text
+        assert "OPERATOR_PROVIDED" in text and "override" in text.lower()
+        assert OPERATOR_OVERRIDE in text
+        assert "The reviewed path reached the critical role." in text
+
+
+def test_attack_chain_does_not_relax_finding_refusal_gate(chain_source: SourceFixture) -> None:
+    write_override(chain_source)
+    chain_source.findings[1]["status"] = "PENDING_VALIDATION"
+    with chain_source.client() as connected:
+        response = render(connected, ["attack_narratives"])
+    assert_refused(response, 409)
+    assert response.json()["detail"] == "All findings must be CONFIRMED or FALSE_POSITIVE"
+    assert all(request.url.host == "m2.test" for request in chain_source.requests)
+
+
+def test_attack_chain_change_during_render_prevents_release(chain_source: SourceFixture) -> None:
+    chain_source.next_chain_paths = (replace(chain_source.chain_paths[0], tier0_reached=False),)
+    with chain_source.client() as connected:
+        response = render(connected, ["attack_narratives"])
+    assert_refused(response, 409)
+    assert response.json()["detail"] == "Attack chains changed during rendering. Review and retry."
+
+
+@pytest.mark.parametrize("graph_state", ["unreachable", "different-path"])
+def test_attack_chain_renders_without_optional_graph_context(
+    chain_source: SourceFixture, graph_state: str,
+) -> None:
+    if graph_state == "unreachable":
+        chain_source.graph_available = False
+    else:
+        chain_source.graph_edges = chain_source.graph_edges[:-1]
+    with chain_source.client() as connected:
+        texts = narrative_texts(render(connected, ["attack_narratives"]))
+    assert len(chain_source.graph_requests) == 1
+    for text in texts:
+        assert "CHAIN_DERIVED" in text and "Recorded access to org-admin" in text
+        assert all(digest in "".join(text.split()) for digest in chain_source.artifacts)
+        assert "Graph path cost:" not in text
+        assert all(str(node) not in text for node in chain_source.chain_paths[0].node_ids)

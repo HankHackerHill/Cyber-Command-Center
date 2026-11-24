@@ -10,6 +10,7 @@ from enum import StrEnum
 from io import BytesIO
 from pathlib import Path
 from typing import Literal
+from uuid import UUID
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
@@ -44,6 +45,24 @@ class ReportFinding:
 
 
 @dataclass(frozen=True)
+class NarrativeHop:
+    finding: ReportFinding
+    technique_summary: str | None
+    source_node: UUID
+    destination_node: UUID
+
+
+@dataclass(frozen=True)
+class ReportChain:
+    id: str
+    hops: tuple[NarrativeHop, ...]
+    impact_summary: str | None
+    tier0_reached: bool
+    path_cost: float | None = None
+    operator_override: str | None = None
+
+
+@dataclass(frozen=True)
 class ReportData:
     engagement_id: str
     manifest_hash: str
@@ -53,6 +72,7 @@ class ReportData:
     teardown_receipt_json: str
     findings: tuple[ReportFinding, ...]
     attack_narratives: tuple[str, ...] = ()
+    chains: tuple[ReportChain, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -84,6 +104,12 @@ def _score(finding: ReportFinding) -> str:
     return f"{finding.cvss_score:.1f}" if finding.cvss_score is not None else "Unscored"
 
 
+def _evidence_paths(links: Sequence[str]) -> list[Paragraph]:
+    if any(not re.fullmatch(r"/artifacts/[0-9a-f]{64}", link) for link in links):
+        raise ValueError("Invalid M7 evidence path")
+    return [Paragraph(link, "evidence") for link in sorted(links)]
+
+
 def _details(findings: Sequence[ReportFinding]) -> list[Paragraph]:
     blocks: list[Paragraph] = []
     for finding in findings:
@@ -95,17 +121,57 @@ def _details(findings: Sequence[ReportFinding]) -> list[Paragraph]:
         if finding.cvss_vector:
             blocks.append(Paragraph(finding.cvss_vector, "code"))
         blocks.append(Paragraph("Evidence links (M7 paths)", "subheading"))
-        for link in sorted(finding.evidence_links):
-            if not re.fullmatch(r"/artifacts/[0-9a-f]{64}", link):
-                raise ValueError("Invalid M7 evidence path")
-            blocks.append(Paragraph(link, "evidence"))
-        if not finding.evidence_links:
-            blocks.append(Paragraph("No evidence links supplied."))
+        blocks.extend(_evidence_paths(finding.evidence_links) or [Paragraph("No evidence links supplied.")])
         blocks.append(Paragraph("Reproduction steps", "subheading"))
         blocks.extend(Paragraph(f"{i}. {step}") for i, step in enumerate(finding.reproduction_steps, 1))
         if not finding.reproduction_steps:
             blocks.append(Paragraph("No reviewed reproduction steps supplied."))
     return blocks or [Paragraph("No findings recorded.")]
+
+
+def _narratives(chains: Sequence[ReportChain], operator_text: Sequence[str]) -> list[Paragraph]:
+    blocks: list[Paragraph] = []
+    for chain in sorted(chains, key=lambda record: record.id):
+        if not chain.hops:
+            raise ValueError("Narrative chains require at least one hop")
+        if chain.operator_override is not None:
+            blocks.extend((Paragraph(f"OPERATOR_PROVIDED · Narrative override for {chain.id}", "subheading"),
+                           Paragraph(chain.operator_override)))
+        blocks.append(Paragraph(f"CHAIN_DERIVED · {chain.id}", "subheading"))
+        if any(hop.finding.status != "CONFIRMED" for hop in chain.hops):
+            blocks.append(Paragraph("Path includes findings without CONFIRMED disposition."))
+        for number, hop in enumerate(chain.hops, 1):
+            finding = hop.finding
+            position = "Entry point and hop 1" if number == 1 else f"Hop {number}"
+            blocks.extend((
+                Paragraph(f"{position} · {finding.id} · {finding.title}", "subheading"),
+                Paragraph(f"Status: {finding.status}"),
+                Paragraph(f"Technique: {hop.technique_summary or 'No reviewed summary supplied.'}"),
+                Paragraph(f"CVSS v4.0: {_score(finding)}"),
+            ))
+            if finding.cvss_vector:
+                blocks.append(Paragraph(finding.cvss_vector, "code"))
+            if chain.path_cost is not None:
+                blocks.append(Paragraph(f"Graph nodes: {hop.source_node} → {hop.destination_node}"))
+            paths = _evidence_paths(finding.evidence_links)
+            if not paths:
+                raise ValueError("Narrative hops require M7 evidence")
+            blocks.extend((Paragraph(f"CWE: {finding.cwe or 'Unmapped'}"),
+                           Paragraph("Evidence SHA-256 and retrieval (M7 paths)"), *paths))
+        high = max((hop.finding.cvss_score for hop in chain.hops if hop.finding.cvss_score is not None),
+                   default=None)
+        rollup = "Unscored" if high is None else f"{high:.1f}"
+        blocks.extend((
+            Paragraph(f"Impact summary: {chain.impact_summary or 'No reviewed summary supplied.'}"),
+            Paragraph(f"Tier-0 reached (recorded path): {str(chain.tier0_reached).lower()}"),
+            Paragraph(f"CVSS v4.0 rollup (maximum hop score): {rollup}"),
+        ))
+        if chain.path_cost is not None:
+            blocks.append(Paragraph(f"Graph path cost: {chain.path_cost}"))
+    if operator_text:
+        blocks.append(Paragraph("OPERATOR_PROVIDED · Supplemental narratives", "subheading"))
+        blocks.extend(Paragraph(text) for text in operator_text)
+    return blocks or [Paragraph("No reviewed attack narratives supplied.")]
 
 
 def _chapters(data: ReportData, sections: Sequence[Section]) -> list[Chapter]:
@@ -161,8 +227,7 @@ def _chapters(data: ReportData, sections: Sequence[Section]) -> list[Chapter]:
         chapters.append(Chapter(Section.FINDING_DETAILS, "Finding details", _details(findings)))
     if Section.ATTACK_NARRATIVES in wanted:
         chapters.append(Chapter(Section.ATTACK_NARRATIVES, "Attack narratives",
-                                [Paragraph(text) for text in data.attack_narratives] or
-                                [Paragraph("No reviewed attack narratives supplied.")]))
+                                _narratives(data.chains, data.attack_narratives)))
     if Section.REMEDIATION in wanted:
         recommendations: list[Paragraph] = []
         for number, finding in enumerate(confirmed, 1):
@@ -178,7 +243,10 @@ def _chapters(data: ReportData, sections: Sequence[Section]) -> list[Chapter]:
         Paragraph("Audit-ledger excerpt", "subheading"), Paragraph(data.ledger_excerpt_json, "code"),
         Paragraph("Workspace teardown receipt", "subheading"), Paragraph(data.teardown_receipt_json, "code"),
     ]
-    if Section.FINDINGS in wanted and any(f.cwe and " — " in f.cwe for f in findings):
+    cwe_findings = list(findings) if Section.FINDINGS in wanted else []
+    if Section.ATTACK_NARRATIVES in wanted:
+        cwe_findings.extend(hop.finding for chain in data.chains for hop in chain.hops)
+    if any(f.cwe and " — " in f.cwe for f in cwe_findings):
         appendix.extend((Paragraph("CWE taxonomy attribution", "subheading"), Paragraph(CWE_LICENSE_NOTICE)))
     chapters.append(Chapter(Section.APPENDIX, "Appendix", appendix))
     return chapters
