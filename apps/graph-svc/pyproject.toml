@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redops-graph-svc"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "redops-contracts==0.1.0",
+    "fastapi>=0.115,<1",
+    "psycopg[binary]>=3.2,<4",
+    "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+test = ["httpx>=0.27,<1", "mypy>=1.11", "pytest>=8"]
+
+# Internal service: uvicorn main:app. DATABASE_URL must use a service account
+# with SELECT on engagements, asset_nodes and asset_edges only. Reads use a
+# consistent, read-only snapshot; graph analysis never contacts target assets.
+# Tests inject synthetic graphs; no database or client network is required.
+[tool.uv.sources]
+redops-contracts = { path = "../../packages/contracts-py" }
+
+[tool.setuptools]
+py-modules = ["main", "paths"]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "../../packages/contracts-py"]
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+exclude = ['^(\./)?build/']
+plugins = ["pydantic.mypy"]
+mypy_path = "$MYPY_CONFIG_FILE_DIR/../../packages/contracts-py"
